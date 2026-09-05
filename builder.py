@@ -5,6 +5,7 @@ Creates CMake commands and runs the build process with live logging.
 import subprocess
 import os
 import json
+import stat
 import time
 from datetime import datetime
 from config import (
@@ -20,6 +21,72 @@ def get_build_path(source_id, build_type):
     """Generate a build output path."""
     source_name = source_id.replace("_", "-")
     return os.path.join(BUILDS_DIR, f"{source_name}-{build_type.lower()}")
+
+
+def find_source_checkout(source_id):
+    """Find the newest versioned source checkout for a source in BUILDS_DIR."""
+    source = get_source_by_id(source_id) or {}
+    local_path = source.get("local_path") or source_id
+    suffix = os.path.basename(os.path.normpath(local_path))
+    if not suffix or not os.path.isdir(BUILDS_DIR):
+        return None
+    candidates = []
+    for name in os.listdir(BUILDS_DIR):
+        if not name.endswith("_" + suffix):
+            continue
+        path = os.path.join(BUILDS_DIR, name)
+        if os.path.isdir(path):
+            candidates.append(path)
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def _on_rm_error(func, path, exc_info):
+    # Git marks object files read-only on Windows; clear the bit and retry.
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
+
+
+def _remove_with_retry(path, attempts=10, delay=2.0):
+    """Remove a file or directory tree, retrying while files are still locked
+    (MSBuild nodes, antivirus scanners) right after a build."""
+    import shutil
+    for _ in range(attempts):
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, onerror=_on_rm_error)
+            else:
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    os.chmod(path, stat.S_IWRITE)
+                    os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except Exception:
+            time.sleep(delay)
+    return False
+
+
+def trim_build_folder(checkout_dir):
+    """Keep only build/bin inside the checkout (the Auto-Tuner-compatible
+    layout holding llama-server) and remove the source tree plus all other
+    CMake artifacts."""
+    build_dir = os.path.join(checkout_dir, "build")
+    if os.path.isdir(build_dir):
+        for name in os.listdir(build_dir):
+            if name.lower() == "bin":
+                continue
+            _remove_with_retry(os.path.join(build_dir, name))
+    for name in os.listdir(checkout_dir):
+        if name.lower() == "build":
+            continue
+        _remove_with_retry(os.path.join(checkout_dir, name))
 
 
 def setup_cuda_vs_integration():
@@ -205,8 +272,13 @@ def run_build(source_id, build_type, update_repo_flag=False,
     """
     Run the full build process using the platform build script.
     Windows uses build_llamacpp.ps1 (PowerShell); macOS/Linux use
-    build_llamacpp.sh. Returns (success, output_lines, error_message, binaries).
-    callback(line) is called for each output line.
+    build_llamacpp.sh. Returns (success, output_lines, error_message,
+    binaries, build_path). callback(line) is called for each output line.
+
+    After a successful build the checkout is trimmed to an Auto-Tuner-
+    compatible layout: builds/<version>_<backend>_<source>/build/bin/...
+    keeps the finished llama-server while the source tree and all other
+    CMake artifacts are deleted.
     """
     import sys
     import io
@@ -224,7 +296,7 @@ def run_build(source_id, build_type, update_repo_flag=False,
         msg = f"Source '{source_id}' not found."
         if callback:
             callback(msg)
-        return False, [msg], msg, []
+        return False, [msg], msg, [], ""
 
     system = platform.system()
 
@@ -232,6 +304,7 @@ def run_build(source_id, build_type, update_repo_flag=False,
     # may contain spaces (e.g. -DCMAKE_PREFIX_PATH=...) without quoting issues.
     flags_str = "\n".join(custom_flags) if custom_flags else ""
 
+    # Final output folder for the finished binaries.
     build_path = get_build_path(source_id, build_type)
 
     if system == "Windows":
@@ -240,13 +313,14 @@ def run_build(source_id, build_type, update_repo_flag=False,
             msg = f"Build script not found: {script_path}"
             if callback:
                 callback(msg)
-            return False, [msg], msg, []
+            return False, [msg], msg, [], ""
         # Use -File (not -Command) so args are bound cleanly and there are no
         # quoting headaches around -ExtraFlags / build paths.
+        # No -BuildDir: the script builds inside the source checkout and the
+        # results are consolidated into build_path afterwards.
         cmd = ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File", script_path,
                "-Source", source_id, "-BuildType", build_type,
                "-InstallDir", BUILDS_DIR,
-               "-BuildDir", build_path,
                "-DepsDir", os.path.join(EXE_DIR, "deps")]
         if source.get("repo_url"):
             cmd += ["-RepoUrl", source.get("repo_url")]
@@ -277,9 +351,10 @@ def run_build(source_id, build_type, update_repo_flag=False,
             msg = f"Build script not found: {script_path}"
             if callback:
                 callback(msg)
-            return False, [msg], msg, []
-        cmd = ["bash", script_path, "-s", source_id, "-t", build_type, "-d", BUILDS_DIR,
-               "-B", build_path]
+            return False, [msg], msg, [], ""
+        # No -B: the script builds inside the source checkout and the results
+        # are consolidated into build_path afterwards.
+        cmd = ["bash", script_path, "-s", source_id, "-t", build_type, "-d", BUILDS_DIR]
         if source.get("repo_url"):
             cmd += ["-r", source.get("repo_url")]
         if source.get("branch"):
@@ -337,23 +412,37 @@ def run_build(source_id, build_type, update_repo_flag=False,
             msg = f"Build failed with exit code {process.returncode}"
             if callback:
                 callback(msg)
-            return False, all_output, msg, []
+            return False, all_output, msg, [], ""
 
-        # Find binaries
-        binaries = find_binaries(build_path)
+        # One Auto-Tuner-compatible folder per build: <checkout>/build/bin/...
+        # holds the finished llama-server. Source tree and CMake artifacts
+        # are removed afterwards.
+        checkout_dir = find_source_checkout(source_id)
+        cmake_dir = os.path.join(checkout_dir, "build") if checkout_dir else None
+        binaries = find_binaries(cmake_dir) if cmake_dir else []
+        if not binaries:
+            # Fallback for unexpected layouts: keep whatever is in build_path.
+            binaries = find_binaries(build_path)
+
+        if checkout_dir and os.path.isdir(checkout_dir):
+            if callback:
+                callback(f"Cleaning up source/CMake files in: {checkout_dir}")
+            trim_build_folder(checkout_dir)
+            build_path = checkout_dir
 
         if callback:
             callback("=" * 60)
             callback("BUILD SUCCESSFUL!")
+            callback(f"Output: {build_path}")
             callback(f"Binaries found: {len(binaries)}")
 
-        return True, all_output, None, binaries
+        return True, all_output, None, binaries, build_path
 
     except Exception as e:
         msg = f"Build error: {str(e)}"
         if callback:
             callback(msg)
-        return False, [msg], msg, []
+        return False, [msg], msg, [], ""
 
 
 def run_command(cmd, cwd=None, callback=None):
@@ -393,12 +482,15 @@ _BINARY_SKIP_SUFFIXES = (
 
 
 def find_binaries(build_path):
-    """Find built executables in the build directory."""
+    """Find built executables in the build directory (under bin/)."""
     binaries = []
     if not os.path.isdir(build_path):
         return binaries
 
     for root, dirs, files in os.walk(build_path):
+        parts = os.path.normpath(root).lower().split(os.sep)
+        if "bin" not in parts:
+            continue
         for f in files:
             if not f.startswith("llama-"):
                 continue

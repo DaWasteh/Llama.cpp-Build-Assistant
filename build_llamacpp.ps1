@@ -34,6 +34,10 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
 
+# Do not keep MSBuild node processes alive after the build. Lingering nodes
+# hold file handles that prevent cleaning up the checkout afterwards.
+$env:MSBUILDDISABLENODEREUSE = "1"
+
 # Directory containing this script (needed for the deps/ cache even when
 # InstallDir is passed explicitly by the GUI).
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -872,7 +876,16 @@ git config --global core.longpaths true
 OK "git core.longpaths enabled"
 
 $versionPrefixPattern = if ($REPO_PR) { "pr$REPO_PR" } else { "(?:b\d+|bUNKNOWN)" }
-$existingDir = Get-ChildItem $InstallDir -Directory | Where-Object { $_.Name -match "^${versionPrefixPattern}_$([regex]::Escape($DIR_SUFFIX))$" } | Sort-Object Name -Descending | Select-Object -First 1
+# Backend-qualified, Auto-Tuner-compatible folder name, e.g.
+# "b10819_vulkan_llama.cpp-main". One folder per source+version+backend.
+$backend = $BuildType.ToLower()
+$existingDir = Get-ChildItem $InstallDir -Directory | Where-Object { $_.Name -match "^${versionPrefixPattern}_${backend}_$([regex]::Escape($DIR_SUFFIX))$" } | Sort-Object Name -Descending | Select-Object -First 1
+if ($existingDir -and -not (Test-Path (Join-Path $existingDir.FullName ".git"))) {
+    # A previous run trimmed the checkout to its build output; it is no
+    # longer a git repository, so clone it fresh.
+    Remove-PathWithRetry $existingDir.FullName
+    $existingDir = $null
+}
 
 if ($existingDir) {
     $dir = $existingDir.FullName
@@ -962,7 +975,7 @@ if ($existingDir) {
         if (-not $ver) { $ver = "bUNKNOWN" }
         Pop-Location
     }
-    $dir = Join-Path $InstallDir "${ver}_$DIR_SUFFIX"
+    $dir = Join-Path $InstallDir "${ver}_${backend}_$DIR_SUFFIX"
     Set-Location $InstallDir
     if (Test-Path -LiteralPath $dir) { Remove-PathWithRetry $dir }
     Move-PathWithRetry $tmpDir $dir
@@ -972,6 +985,8 @@ if ($existingDir) {
 # --- 9. CMAKE CONFIGURE ---
 Log "CMake configuration ($BuildType)"
 if ([string]::IsNullOrEmpty($BuildDir)) {
+    # Standard llama.cpp layout (build/bin/Release/...) so launchers such as
+    # Auto-Tuner can auto-discover llama-server inside this folder.
     $buildDir = Join-Path $dir "build"
 } else {
     $buildDir = $BuildDir

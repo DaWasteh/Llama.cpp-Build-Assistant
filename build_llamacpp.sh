@@ -35,7 +35,7 @@ Usage: $0 -s SOURCE -t TYPE [-d INSTALL_DIR] [-B BUILD_DIR] [-j JOBS] [-u] [-U] 
   -s SOURCE      main|turboquant|ternary_bonsai|ocr_llama|diffusion_gemma
   -t TYPE        CPU|CUDA|Vulkan|HIP|SYCL|Metal
   -d INSTALL_DIR dir holding the source checkout (default: ./builds)
-  -B BUILD_DIR   CMake build/output dir (default: <checkout>/build)
+  -B BUILD_DIR   CMake build/output dir (default: <checkout>/build_<TYPE>)
   -j JOBS        parallel jobs (default: nproc)
   -u             build the web UI (needs npm)
   -U             update the existing checkout (git fetch + reset)
@@ -206,7 +206,16 @@ git config --global core.longpaths true 2>/dev/null || true
 ok "git core.longpaths enabled"
 
 dir=""
-existing=$(find . -maxdepth 1 -type d -regex "\./b[0-9]\+_${DIR_SUFFIX}" 2>/dev/null | sort -r | head -1 || true)
+# Backend-qualified, Auto-Tuner-compatible folder name, e.g.
+# "b10819_vulkan_llama.cpp". One folder per source+version+backend.
+backend="$(printf '%s' "$BUILD_TYPE" | tr '[:upper:]' '[:lower:]')"
+existing=$(find . -maxdepth 1 -type d -regex "\./b[0-9]\+_${backend}_${DIR_SUFFIX}" 2>/dev/null | sort -r | head -1 || true)
+if [[ -n "$existing" && ! -d "$existing/.git" ]]; then
+    # A previous run trimmed the checkout to its build output; it is no
+    # longer a git repository, so clone it fresh.
+    rm -rf "$existing"
+    existing=""
+fi
 if [[ -n "$existing" ]]; then
     dir="$existing"
     if [[ "$UPDATE_REPO" == "1" ]]; then
@@ -254,7 +263,7 @@ else
         ver=$(echo "$desc" | grep -oE 'b[0-9]+' | head -1 || true)
         [[ -z "$ver" ]] && ver="bUNKNOWN"
     fi
-    dir="./${ver}_${DIR_SUFFIX}"
+    dir="./${ver}_${backend}_${DIR_SUFFIX}"
     rm -rf "$dir"
     mv "$tmp" "$dir"
     ok "Directory: $dir"
@@ -274,6 +283,8 @@ fi
 if [[ -n "$BUILD_DIR_ARG" ]]; then
     build_dir="$BUILD_DIR_ARG"
 else
+    # Standard llama.cpp layout (build/bin/...) so launchers such as
+    # Auto-Tuner can auto-discover llama-server inside this folder.
     build_dir="$dir/build"
 fi
 if [[ "$CLEAN_BUILD" == "1" ]]; then

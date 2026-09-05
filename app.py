@@ -1137,7 +1137,7 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                 def callback(line):
                     self._queue_build_log(line)
 
-                success, output, error_msg, binaries = run_build(
+                success, output, error_msg, binaries, build_path = run_build(
                     source_id, bt,
                     update_repo_flag=update_repo,
                     custom_flags=profile_flags,
@@ -1149,7 +1149,8 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                 duration = time.time() - start_time
 
                 # Save result
-                build_path = get_build_path(source_id, bt)
+                if not build_path:
+                    build_path = get_build_path(source_id, bt)
                 save_build_result(source_id, bt, success, build_path,
                                   binaries, duration, error_msg)
 
