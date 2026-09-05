@@ -81,7 +81,6 @@ python app.py
 ├── build_llamacpp.ps1       # Windows build pipeline
 ├── build_llamacpp.sh        # macOS/Linux build pipeline
 ├── start.bat / start.sh     # Launchers (use python_manager)
-├── tests/                   # pytest suite
 ├── data/                    # Config + history JSON
 └── pyproject.toml
 ```
