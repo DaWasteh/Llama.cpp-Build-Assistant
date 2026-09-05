@@ -1,11 +1,11 @@
 """
 Source manager module.
 Manages all llama.cpp sources, forks, branches, and custom repositories.
-Reads and writes to build_sources.json.
+Reads and writes to sources.json.
 """
 import json
 import os
-from config import BUILD_SOURCES_FILE, DEFAULT_BUILD_SOURCES
+from config import BUILD_SOURCES_FILE, LEGACY_BUILD_SOURCES_FILE, REPOS_DIR
 
 
 def load_sources():
@@ -14,13 +14,23 @@ def load_sources():
         try:
             with open(BUILD_SOURCES_FILE, "r") as f:
                 data = json.load(f)
-                if isinstance(data, list) and len(data) > 0:
+                if isinstance(data, list):
                     return data
         except Exception:
             pass
-    # Default: save defaults and return them
-    save_sources(DEFAULT_BUILD_SOURCES)
-    return DEFAULT_BUILD_SOURCES.copy()
+
+    if os.path.exists(LEGACY_BUILD_SOURCES_FILE):
+        try:
+            with open(LEGACY_BUILD_SOURCES_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    save_sources(data)
+                    return data
+        except Exception:
+            pass
+
+    save_sources([])
+    return []
 
 
 def save_sources(sources):
@@ -48,8 +58,9 @@ def get_source_by_name(name):
     return None
 
 
-def add_source(name, repo_url, branch, local_path, source_type="custom",
-               experimental=True, default_cmake_flags=None):
+def add_source(name, repo_url, branch, local_path=None, source_type="custom",
+               experimental=True, default_cmake_flags=None, commit="",
+               fetch_ref=""):
     """Add a new build source."""
     sources = load_sources()
 
@@ -62,6 +73,9 @@ def add_source(name, repo_url, branch, local_path, source_type="custom",
         if src.get("id") == source_id:
             return False, "Source with this ID already exists"
 
+    if not local_path:
+        local_path = os.path.join(REPOS_DIR, source_id)
+
     new_source = {
         "id": source_id,
         "name": name,
@@ -72,6 +86,10 @@ def add_source(name, repo_url, branch, local_path, source_type="custom",
         "experimental": experimental,
         "default_cmake_flags": default_cmake_flags or []
     }
+    if commit:
+        new_source["commit"] = commit
+    if fetch_ref:
+        new_source["fetch_ref"] = fetch_ref
 
     sources.append(new_source)
     save_sources(sources)
@@ -84,7 +102,9 @@ def edit_source(source_id, **kwargs):
     for i, src in enumerate(sources):
         if src.get("id") == source_id:
             for key, value in kwargs.items():
-                if key in src:
+                if key in ("commit", "fetch_ref") and not value:
+                    src.pop(key, None)
+                elif key in src or key in ("commit", "fetch_ref"):
                     src[key] = value
             save_sources(sources)
             return True, "Source updated"

@@ -15,7 +15,7 @@ from config import SYSTEM_REPORT_FILE
 def run_cmd(cmd, shell=True):
     """Run a command and return stdout, or None on failure."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = subprocess.run(cmd, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True,
                                 shell=shell, timeout=30, encoding='utf-8', errors='replace')
         if result.returncode == 0:
             return result.stdout.strip()
@@ -28,7 +28,7 @@ def run_powershell(cmd):
     """Run a PowerShell command and return stdout, or None on failure."""
     try:
         ps_cmd = ["powershell", "-Command", cmd]
-        result = subprocess.run(ps_cmd, capture_output=True, text=True,
+        result = subprocess.run(ps_cmd, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True,
                                 timeout=30, encoding='utf-8', errors='replace')
         if result.returncode == 0:
             return result.stdout.strip()

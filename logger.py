@@ -4,6 +4,7 @@ Handles build logs, installation logs, and error logs.
 """
 import os
 import logging
+import sys
 from datetime import datetime
 from config import BUILD_LOG_FILE, INSTALL_LOG_FILE, ERROR_LOG_FILE
 
@@ -27,11 +28,13 @@ def get_logger(log_file, name=None):
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
+    # Console handler is only available for source launches. Windowed
+    # PyInstaller builds usually run with no stdio streams.
+    if sys.stderr is not None:
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
 
     return logger
 

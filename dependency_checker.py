@@ -36,7 +36,7 @@ def get_command_version(name):
 def run_cmd(cmd):
     """Run a command and return stdout or None."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(cmd, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True, timeout=15)
         if result.returncode == 0:
             return result.stdout.strip()
     except Exception:
@@ -65,7 +65,7 @@ def check_compiler():
                     [vswhere, "-latest", "-products", "*",
                      "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
                      "-property", "displayName"],
-                    capture_output=True, text=True, timeout=15
+                    capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True, timeout=15
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     return {"found": True,
@@ -77,7 +77,7 @@ def check_compiler():
         try:
             result = subprocess.run(
                 ["winget", "list", "--id", "Microsoft.VisualStudio.2022.BuildTools"],
-                capture_output=True, text=True, timeout=30
+                capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True, timeout=30
             )
             if result.returncode == 0 and "Visual Studio Build Tools" in result.stdout:
                 return {"found": True, "name": "VS Build Tools installed (cl not in PATH)",
@@ -199,7 +199,7 @@ def check_all():
             import subprocess
             wresult = subprocess.run(
                 ["winget", "list", "--id", "Microsoft.VisualStudio.2022.BuildTools"],
-                capture_output=True, text=True, timeout=30
+                capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True, timeout=30
             )
             if wresult.returncode == 0 and "Visual Studio Build Tools" in wresult.stdout:
                 vs_via_winget = True

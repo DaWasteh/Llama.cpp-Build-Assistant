@@ -1,93 +1,112 @@
-name: release
+name: Release Builds
 
-# Trigger a release by pushing a tag, e.g.:
-#   git tag v2.2.6 && git push origin v2.2.6
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v*.*.*"
 
 permissions:
   contents: write
 
 jobs:
-  # ── Standalone executables (PyInstaller, best-effort per OS) ───────────────
-  # A failure on one OS does NOT block the release; whatever binaries build
-  # successfully are attached to the GitHub Release below.
-  build-binaries:
-    name: PyInstaller (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    continue-on-error: true
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  name: llama-build-assistant-linux }
-          - { os: windows-latest, name: llama-build-assistant-windows }
-          - { os: macos-latest,   name: llama-build-assistant-macos }
+          - name: Windows
+            runner: windows-latest
+            artifact_name: Llama.cpp-Build-Assistant-Windows.exe
+            pyinstaller_name: Llama.cpp-Build-Assistant-Windows
+            icon_arg: build_assets/icon.ico
+            add_data_sep: ";"
+            dist_path: dist/Llama.cpp-Build-Assistant-Windows.exe
+          - name: Linux
+            runner: ubuntu-latest
+            artifact_name: Llama.cpp-Build-Assistant-Linux
+            pyinstaller_name: Llama.cpp-Build-Assistant-Linux
+            icon_arg: build_assets/icon.png
+            add_data_sep: ":"
+            dist_path: dist/Llama.cpp-Build-Assistant-Linux
+          - name: macOS
+            runner: macos-latest
+            artifact_name: Llama.cpp-Build-Assistant-macOS.zip
+            pyinstaller_name: Llama.cpp-Build-Assistant-macOS
+            icon_arg: build_assets/icon.icns
+            add_data_sep: ":"
+            dist_path: dist/Llama.cpp-Build-Assistant-macOS.app
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
-      - name: Install dependencies + PyInstaller
+      - name: Install system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install -r requirements.txt pyinstaller
 
-      - name: Build standalone executable
+      - name: Prepare icons
+        run: python scripts/prepare_icons.py
+
+      - name: Build executable
         shell: bash
         run: |
-          # Bundle customtkinter's assets and psutil's platform binaries.
-          CTK="$(python -c 'import customtkinter, os; print(os.path.dirname(customtkinter.__file__))')"
-          if [ "$RUNNER_OS" = "Windows" ]; then SEP=";"; else SEP=":"; fi
-          pyinstaller --noconfirm --onefile \
-            --add-data "${CTK}${SEP}customtkinter" \
-            --collect-all psutil \
-            --name "${{ matrix.name }}" \
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            --onefile \
+            --windowed \
+            --name "${{ matrix.pyinstaller_name }}" \
+            --icon "${{ matrix.icon_arg }}" \
+            --collect-all customtkinter \
+            --add-data "icon.png${{ matrix.add_data_sep }}." \
+            --add-data "logo.png${{ matrix.add_data_sep }}." \
+            --add-data "VERSION${{ matrix.add_data_sep }}." \
+            --add-data "data/sources.json${{ matrix.add_data_sep }}data" \
+            --add-data "data/profiles.json${{ matrix.add_data_sep }}data" \
+            --add-data "build_llamacpp.ps1${{ matrix.add_data_sep }}." \
+            --add-data "build_llamacpp.sh${{ matrix.add_data_sep }}." \
+            --add-data "build_assets/icon.ico${{ matrix.add_data_sep }}build_assets" \
             app.py
 
-      - name: Upload binary artifact
+      - name: Normalize artifact name
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "${{ matrix.dist_path }}" "${{ matrix.artifact_name }}"
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            if [[ -d "dist/${{ matrix.pyinstaller_name }}.app" ]]; then
+              ditto -c -k --keepParent "dist/${{ matrix.pyinstaller_name }}.app" "${{ matrix.artifact_name }}"
+            else
+              cp "dist/${{ matrix.pyinstaller_name }}" "${{ matrix.pyinstaller_name }}"
+              chmod +x "${{ matrix.pyinstaller_name }}"
+              ditto -c -k "${{ matrix.pyinstaller_name }}" "${{ matrix.artifact_name }}"
+            fi
+          else
+            cp "${{ matrix.dist_path }}" "${{ matrix.artifact_name }}"
+            chmod +x "${{ matrix.artifact_name }}"
+          fi
+
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: dist/*
-          if-no-files-found: warn
-          retention-days: 14
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
 
-  # ── GitHub Release (always created on a v* tag) ───────────────────────────
-  release:
-    needs: build-binaries
-    if: always()
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Read version
-        id: ver
-        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
-
-      - name: Download all binary artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create clean source archive
-        # Only tracked files (no .venv/, builds/, __pycache__/).
-        run: git archive --format=zip -o llama-cpp-build-assistant-${{ steps.ver.outputs.version }}-source.zip HEAD
-
-      - name: Create GitHub Release
+      - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          generate_release_notes: true
-          fail_on_unmatched_files: false
-          files: |
-            llama-cpp-build-assistant-*-source.zip
-            artifacts/**/*
+          files: ${{ matrix.artifact_name }}

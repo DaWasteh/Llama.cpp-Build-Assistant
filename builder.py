@@ -8,8 +8,8 @@ import json
 import time
 from datetime import datetime
 from config import (
-    BUILDS_DIR, BUILD_TYPE_FLAGS, BUILD_TYPE_DISPLAY,
-    BUILD_HISTORY_FILE, ROOT_DIR
+    BUILDS_DIR, BUILD_TYPE_FLAGS,
+    BUILD_HISTORY_FILE, ROOT_DIR, BUNDLE_DIR, EXE_DIR
 )
 from logger import log_build, log_error, log_warning
 from source_manager import get_source_by_id
@@ -19,8 +19,7 @@ from repo_manager import ensure_repo
 def get_build_path(source_id, build_type):
     """Generate a build output path."""
     source_name = source_id.replace("_", "-")
-    type_name = BUILD_TYPE_DISPLAY.get(build_type, build_type).lower().replace("/", "-")
-    return os.path.join(BUILDS_DIR, f"{source_name}-{type_name}")
+    return os.path.join(BUILDS_DIR, f"{source_name}-{build_type.lower()}")
 
 
 def setup_cuda_vs_integration():
@@ -55,7 +54,7 @@ def setup_cuda_vs_integration():
             [vswhere, "-latest", "-products", "*",
              "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
              "-property", "installationPath"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True, timeout=10
         )
         if result.returncode != 0 or not result.stdout.strip():
             return False
@@ -67,7 +66,7 @@ def setup_cuda_vs_integration():
             [vswhere, "-latest", "-products", "*",
              "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
              "-property", "installationVersion"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True, timeout=10
         )
         if version_result.returncode != 0 or not version_result.stdout.strip():
             return False
@@ -128,7 +127,7 @@ def generate_cmake_command(source, build_type, custom_flags=None, clean_build=Fa
                     [vswhere, "-latest", "-products", "*", 
                      "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
                      "-property", "installationVersion"],
-                    capture_output=True, text=True, timeout=10
+                    capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True, timeout=10
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     vs_version = result.stdout.strip().split(".")[0]
@@ -145,7 +144,7 @@ def generate_cmake_command(source, build_type, custom_flags=None, clean_build=Fa
                         [vswhere, "-latest", "-products", "*",
                          "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
                          "-property", "installationPath"],
-                        capture_output=True, text=True, timeout=10
+                        capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True, timeout=10
                     )
                     if vs_path_result.returncode == 0 and vs_path_result.stdout.strip():
                         vs_path = vs_path_result.stdout.strip()
@@ -213,8 +212,8 @@ def run_build(source_id, build_type, update_repo_flag=False,
     import io
     import platform
 
-    # Set stdout encoding to UTF-8 to handle all characters
-    if sys.stdout.encoding != 'utf-8':
+    # Windowed/frozen builds do not always have stdout/stderr streams.
+    if sys.stdout is not None and sys.stdout.encoding != 'utf-8':
         try:
             sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
         except Exception:
@@ -233,8 +232,10 @@ def run_build(source_id, build_type, update_repo_flag=False,
     # may contain spaces (e.g. -DCMAKE_PREFIX_PATH=...) without quoting issues.
     flags_str = "\n".join(custom_flags) if custom_flags else ""
 
+    build_path = get_build_path(source_id, build_type)
+
     if system == "Windows":
-        script_path = os.path.join(ROOT_DIR, "build_llamacpp.ps1")
+        script_path = os.path.join(BUNDLE_DIR, "build_llamacpp.ps1")
         if not os.path.exists(script_path):
             msg = f"Build script not found: {script_path}"
             if callback:
@@ -243,7 +244,24 @@ def run_build(source_id, build_type, update_repo_flag=False,
         # Use -File (not -Command) so args are bound cleanly and there are no
         # quoting headaches around -ExtraFlags / build paths.
         cmd = ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File", script_path,
-               "-Source", source_id, "-BuildType", build_type]
+               "-Source", source_id, "-BuildType", build_type,
+               "-InstallDir", BUILDS_DIR,
+               "-BuildDir", build_path,
+               "-DepsDir", os.path.join(EXE_DIR, "deps")]
+        if source.get("repo_url"):
+            cmd += ["-RepoUrl", source.get("repo_url")]
+        if source.get("branch"):
+            cmd += ["-RepoBranch", source.get("branch")]
+        local_path = source.get("local_path") or source_id
+        cmd += ["-DirSuffix", os.path.basename(os.path.normpath(local_path))]
+        if source.get("commit"):
+            cmd += ["-SourceCommit", source.get("commit")]
+        if source.get("fetch_ref"):
+            cmd += ["-FetchRef", source.get("fetch_ref")]
+        if source.get("pr"):
+            cmd += ["-RepoPr", str(source.get("pr"))]
+        if source.get("submodules"):
+            cmd.append("-RepoSubmodules")
         if update_repo_flag:
             cmd.append("-Update")
         if clean_build:
@@ -254,13 +272,28 @@ def run_build(source_id, build_type, update_repo_flag=False,
             cmd += ["-ExtraFlags", flags_str]
         encoding = 'latin-1'
     else:
-        script_path = os.path.join(ROOT_DIR, "build_llamacpp.sh")
+        script_path = os.path.join(BUNDLE_DIR, "build_llamacpp.sh")
         if not os.path.exists(script_path):
             msg = f"Build script not found: {script_path}"
             if callback:
                 callback(msg)
             return False, [msg], msg, []
-        cmd = ["bash", script_path, "-s", source_id, "-t", build_type]
+        cmd = ["bash", script_path, "-s", source_id, "-t", build_type, "-d", BUILDS_DIR,
+               "-B", build_path]
+        if source.get("repo_url"):
+            cmd += ["-r", source.get("repo_url")]
+        if source.get("branch"):
+            cmd += ["-b", source.get("branch")]
+        local_path = source.get("local_path") or source_id
+        cmd += ["-o", os.path.basename(os.path.normpath(local_path))]
+        if source.get("commit"):
+            cmd += ["-x", source.get("commit")]
+        if source.get("fetch_ref"):
+            cmd += ["-f", source.get("fetch_ref")]
+        if source.get("pr"):
+            cmd += ["-p", str(source.get("pr"))]
+        if source.get("submodules"):
+            cmd.append("-m")
         if update_repo_flag:
             cmd.append("-U")
         if clean_build:
@@ -284,6 +317,7 @@ def run_build(source_id, build_type, update_repo_flag=False,
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             text=True,
             bufsize=1,
             encoding=encoding,
@@ -306,7 +340,6 @@ def run_build(source_id, build_type, update_repo_flag=False,
             return False, all_output, msg, []
 
         # Find binaries
-        build_path = get_build_path(source_id, build_type)
         binaries = find_binaries(build_path)
 
         if callback:
@@ -329,6 +362,7 @@ def run_command(cmd, cwd=None, callback=None):
         process = subprocess.Popen(
             cmd, shell=True, cwd=cwd,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             text=True, bufsize=1
         )
 
@@ -352,17 +386,25 @@ def run_command(cmd, cwd=None, callback=None):
         return False, [err_msg], err_msg
 
 
+_BINARY_SKIP_SUFFIXES = (
+    ".pdb", ".lib", ".dll", ".ilk", ".exp", ".obj", ".o", ".a",
+    ".so", ".dylib", ".manifest", ".recipe",
+)
+
+
 def find_binaries(build_path):
-    """Find built binaries in the build directory."""
+    """Find built executables in the build directory."""
     binaries = []
     if not os.path.isdir(build_path):
         return binaries
 
     for root, dirs, files in os.walk(build_path):
         for f in files:
-            if f.startswith("llama-"):
-                full_path = os.path.join(root, f)
-                binaries.append(full_path)
+            if not f.startswith("llama-"):
+                continue
+            if f.lower().endswith(_BINARY_SKIP_SUFFIXES):
+                continue
+            binaries.append(os.path.join(root, f))
 
     return binaries
 

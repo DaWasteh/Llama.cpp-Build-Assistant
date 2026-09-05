@@ -9,10 +9,17 @@ import threading
 import os
 import json
 import time
+import queue
+import sys
+import shutil
 from datetime import datetime
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 from config import (
-    ROOT_DIR, BUILD_SOURCES_FILE, BUILD_HISTORY_FILE,
+    ROOT_DIR, BUNDLE_DIR, BUILD_SOURCES_FILE, BUILD_HISTORY_FILE,
     SYSTEM_REPORT_FILE, PROFILES_FILE,
     DEFAULT_BUILD_SOURCES, DEFAULT_BUILD_PROFILES,
     BUILD_TYPES, BUILD_TYPE_DISPLAY, BUILD_TYPE_FLAGS
@@ -30,10 +37,10 @@ from source_manager import (
 )
 from builder import (
     run_build, save_build_result, get_build_history,
-    get_error_explanation
+    get_error_explanation, get_build_path
 )
 from repo_manager import ensure_repo
-from profile_manager import load_profiles, add_profile, edit_profile, delete_profile
+from profile_manager import load_profiles, add_profile, edit_profile, delete_profile, get_profile_by_name
 from logger import log_build, log_error, log_warning, log_install
 
 
@@ -50,6 +57,11 @@ DANGER = "#dc2626"
 DANGER_HOVER = "#b91c1c"
 
 
+def resource_path(relative_path):
+    """Return a path that works in source runs and PyInstaller bundles."""
+    return os.path.join(BUNDLE_DIR, relative_path)
+
+
 # ─── Main Application ───────────────────────────────────────────────
 
 class BuildAssistantApp(ctk.CTk):
@@ -60,6 +72,8 @@ class BuildAssistantApp(ctk.CTk):
         self.geometry("1600x1024")
         self.minsize(1200, 800)
         self.configure(fg_color=BG)
+        self._logo_image = None
+        self._tk_icon_image = None
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
@@ -68,17 +82,98 @@ class BuildAssistantApp(ctk.CTk):
         self.hardware_report = None
         self.dep_check_results = None
         self.selected_source = ctk.StringVar(value="main")
+        self.selected_profile = ctk.StringVar(value="")
         self.selected_build_type = ctk.StringVar(value="CPU")
         self.build_sources = load_sources()
         self.build_profiles = load_profiles()
         self.is_building = False
         self._source_name_to_id = {}
+        self._profile_name_to_profile = {}
+        self._build_log_queue = queue.Queue()
+        self._ui_queue = queue.Queue()
+        self._profile_manually_selected = False
+        self._dependency_check_running = False
+        self._resize_stable_size = None
+        self._resize_frozen = False
+        self._resize_thaw_job = None
+
+        self._setup_window_icon()
 
         # Build UI
         self._build_ui()
+        self.after(100, self._process_ui_queue)
+        self.after(300, self._setup_window_icon)
 
         # Auto-run hardware check on start
         self.after(500, self.run_hardware_check)
+
+    def _post_ui(self, callback):
+        self._ui_queue.put(callback)
+
+    def _update_dimensions_event(self, event=None):
+        # Toplevel bindings also receive descendant Configure events. Moving
+        # the native window does not require recalculating CTk dimensions.
+        if event is not None:
+            if event.widget is not self:
+                return
+            size = (event.width, event.height)
+            position = (event.x, event.y)
+            previous_position = getattr(self, "_last_window_position", None)
+            previous_size = getattr(self, "_last_window_size", None)
+            self._last_window_position = position
+            self._last_window_size = size
+            if previous_position is not None and (position != previous_position or size != previous_size):
+                self._window_motion_until = time.monotonic() + 0.15
+            if previous_size is not None and size != previous_size:
+                self._on_window_resized(previous_size)
+            if size == previous_size:
+                return
+        super()._update_dimensions_event(event)
+
+    def _on_window_resized(self, previous_size):
+        # A full Tk relayout of this UI costs several hundred milliseconds.
+        # On any resize (live window drag, Aero Snap previews, maximize) the
+        # content is frozen at its last stable size and relaid out only once
+        # the window has settled, instead of on every drag frame.
+        if self._resize_stable_size is None:
+            self._resize_stable_size = previous_size
+        if not self._resize_frozen and hasattr(self, "_content_shell"):
+            self._resize_frozen = True
+            self._content_shell.place_configure(relwidth="", relheight="",
+                                                width=self._resize_stable_size[0],
+                                                height=self._resize_stable_size[1])
+        if self._resize_thaw_job is not None:
+            self.after_cancel(self._resize_thaw_job)
+        self._resize_thaw_job = self.after(150, self._thaw_resize)
+
+    def _thaw_resize(self):
+        self._resize_thaw_job = None
+        if not self._resize_frozen:
+            return
+        if not self.winfo_exists():
+            return
+        self._resize_frozen = False
+        self._resize_stable_size = None
+        self._content_shell.place_configure(width="", height="", relwidth=1, relheight=1)
+        self.update_idletasks()
+
+    def _process_ui_queue(self):
+        if time.monotonic() < getattr(self, "_window_motion_until", 0):
+            self.after(100, self._process_ui_queue)
+            return
+        # Limit work per tick so large bursts leave time for native window events.
+        deadline = time.monotonic() + 0.008
+        while time.monotonic() < deadline:
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                self.report_callback_exception(*sys.exc_info())
+        self._flush_build_log()
+        self.after(100, self._process_ui_queue)
 
     def _card(self, parent, **kwargs):
         return ctk.CTkFrame(
@@ -155,16 +250,68 @@ class BuildAssistantApp(ctk.CTk):
         )
         return widget
 
+    def _setup_window_icon(self):
+        # Windows title bar: set a .ico via iconbitmap. CustomTkinter swaps in
+        # its own icon ~200ms after init unless iconbitmap() has been called
+        # (it tracks _iconbitmap_method_called), so iconphoto alone is lost.
+        if sys.platform == "win32":
+            self._set_app_user_model_id()
+            ico_path = resource_path(os.path.join("build_assets", "icon.ico"))
+            if os.path.exists(ico_path):
+                try:
+                    self.iconbitmap(ico_path)
+                except Exception as exc:
+                    log_warning(f"Could not set icon bitmap '{ico_path}': {exc}")
+        # Linux window managers / Alt-Tab and cross-platform fallback.
+        for filename in ("icon.png", "logo.png"):
+            path = resource_path(filename)
+            if not os.path.exists(path):
+                continue
+            try:
+                import tkinter as tk
+                self._tk_icon_photo = tk.PhotoImage(file=path)
+                self.iconphoto(True, self._tk_icon_photo)
+                return
+            except Exception as exc:
+                log_warning(f"Could not load app icon '{path}': {exc}")
+
+    def _set_app_user_model_id(self):
+        # Stable Windows app identity so taskbar/Alt-Tab show our icon instead
+        # of grouping us under the Python interpreter.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "LlamaCppBuildAssistant")
+        except Exception:
+            pass
+
+    def _create_logo_widget(self, parent):
+        logo_path = resource_path("logo.png")
+        if Image and os.path.exists(logo_path):
+            try:
+                image = Image.open(logo_path)
+                self._logo_image = ctk.CTkImage(light_image=image, dark_image=image, size=(34, 34))
+                return ctk.CTkLabel(parent, text="", image=self._logo_image,
+                                    width=34, height=34)
+            except Exception as exc:
+                log_warning(f"Could not load GUI logo '{logo_path}': {exc}")
+        return ctk.CTkLabel(parent, text="L", width=34, height=34, corner_radius=8,
+                            fg_color=BLUE, text_color="white",
+                            font=ctk.CTkFont(size=18, weight="bold"))
+
     def _build_ui(self):
         """Build the main GUI layout."""
+        # Single shell holding the whole UI. It is managed via place() so the
+        # layout can be frozen cheaply while the window is being dragged/resized.
+        self._content_shell = ctk.CTkFrame(self, corner_radius=0, fg_color=BG)
+        self._content_shell.place(x=0, y=0, relwidth=1, relheight=1)
+
         # ── Top bar ──
-        top_frame = ctk.CTkFrame(self, height=64, corner_radius=0, fg_color=BG)
+        top_frame = ctk.CTkFrame(self._content_shell, height=64, corner_radius=0, fg_color=BG)
         top_frame.pack(fill="x", padx=0, pady=0)
         top_frame.pack_propagate(False)
 
-        logo = ctk.CTkLabel(top_frame, text="L", width=34, height=34, corner_radius=8,
-                            fg_color=BLUE, text_color="white",
-                            font=ctk.CTkFont(size=18, weight="bold"))
+        logo = self._create_logo_widget(top_frame)
         logo.pack(side="left", padx=(18, 12), pady=15)
 
         title_label = ctk.CTkLabel(top_frame, text="Llama.cpp Build Assistant",
@@ -181,7 +328,7 @@ class BuildAssistantApp(ctk.CTk):
 
 
         # ── Tabview ──
-        body = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        body = ctk.CTkFrame(self._content_shell, fg_color=BG, corner_radius=0)
         body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
@@ -398,16 +545,18 @@ class BuildAssistantApp(ctk.CTk):
         self.source_combo.pack(padx=20, pady=(5, 15), fill="x")
         self._update_source_combo()
 
-        bt_frame = self._card(scroll_frame)
-        bt_frame.pack(fill="x", padx=25, pady=8)
-        ctk.CTkLabel(bt_frame, text="Build Type:",
+        profile_frame = self._card(scroll_frame)
+        profile_frame.pack(fill="x", padx=25, pady=8)
+        ctk.CTkLabel(profile_frame, text="Build Profile:",
                       font=ctk.CTkFont(size=14, weight="bold")).pack(
             padx=20, pady=(15, 8), anchor="w")
 
-        self.build_type_combo = self._style_combo(ctk.CTkComboBox(bt_frame, values=BUILD_TYPES,
-                                                                  variable=self.selected_build_type,
-                                                                  corner_radius=8, height=36))
-        self.build_type_combo.pack(padx=20, pady=(5, 15), fill="x")
+        self.profile_combo = self._style_combo(ctk.CTkComboBox(profile_frame, values=[],
+                                                               variable=self.selected_profile,
+                                                               command=self._on_manual_profile_changed,
+                                                               corner_radius=8, height=36))
+        self.profile_combo.pack(padx=20, pady=(5, 15), fill="x")
+        self._update_profile_combo()
 
         opt_frame = self._card(scroll_frame)
         opt_frame.pack(fill="x", padx=25, pady=8)
@@ -433,30 +582,6 @@ class BuildAssistantApp(ctk.CTk):
                          variable=self.build_ui_var,
                          font=ctk.CTkFont(size=13)).pack(
             padx=20, pady=(4, 15), anchor="w")
-
-        cmake_frame = self._card(scroll_frame)
-        cmake_frame.pack(fill="x", padx=25, pady=8)
-        ctk.CTkLabel(cmake_frame, text="Custom CMake Flags (optional):",
-                      font=ctk.CTkFont(size=14, weight="bold")).pack(
-            padx=20, pady=(15, 8), anchor="w")
-        self.cmake_flags_entry = self._style_field(ctk.CTkEntry(cmake_frame, placeholder_text="-DGGML_NATIVE=ON",
-                                                                corner_radius=8, height=36))
-        self.cmake_flags_entry.pack(padx=20, pady=(5, 15), fill="x")
-
-        self.custom_frame = self._card(scroll_frame)
-        self.custom_frame.pack(fill="x", padx=25, pady=8)
-        ctk.CTkLabel(self.custom_frame, text="Custom Repository URL:",
-                      font=ctk.CTkFont(size=13)).pack(padx=20, pady=(10, 5), anchor="w")
-        self.custom_url_entry = self._style_field(ctk.CTkEntry(self.custom_frame,
-                                                               placeholder_text="https://github.com/user/repo",
-                                                               corner_radius=8, height=36))
-        self.custom_url_entry.pack(padx=20, pady=5, fill="x")
-        ctk.CTkLabel(self.custom_frame, text="Branch:",
-                      font=ctk.CTkFont(size=13)).pack(padx=20, pady=(10, 5), anchor="w")
-        self.custom_branch_entry = self._style_field(ctk.CTkEntry(self.custom_frame,
-                                                                  placeholder_text="master",
-                                                                  corner_radius=8, height=36))
-        self.custom_branch_entry.pack(padx=20, pady=(5, 15), fill="x")
 
         btn_frame = self._card(scroll_frame)
         btn_frame.pack(fill="x", padx=25, pady=15)
@@ -506,13 +631,6 @@ class BuildAssistantApp(ctk.CTk):
                       font=ctk.CTkFont(size=24, weight="bold")).pack(
             padx=25, pady=(20, 10), anchor="w")
 
-        # List
-        self.sources_listbox = self._style_textbox(ctk.CTkTextbox(frame, height=250, font=ctk.CTkFont(size=12),
-                                                                  corner_radius=8))
-        self.sources_listbox.pack(fill="both", expand=True, padx=25, pady=8)
-        self._update_sources_list()
-
-        # Buttons
         btn_frame = self._card(frame)
         btn_frame.pack(fill="x", padx=25, pady=8)
 
@@ -521,40 +639,10 @@ class BuildAssistantApp(ctk.CTk):
                        corner_radius=8, height=36,
                        fg_color=BLUE, hover_color=BLUE_HOVER).pack(
             side="left", padx=10, pady=15)
-        ctk.CTkButton(btn_frame, text="Edit Source",
-                       command=self.edit_selected_source,
-                       corner_radius=8, height=36).pack(
-            side="left", padx=10, pady=15)
-        ctk.CTkButton(btn_frame, text="Delete Source",
-                       command=self.delete_selected_source,
-                       corner_radius=8, height=36,
-                       fg_color=DANGER, hover_color=DANGER_HOVER).pack(
-            side="left", padx=10, pady=15)
 
-        # Edit form
-        edit_frame = self._card(frame)
-        edit_frame.pack(fill="x", padx=25, pady=8)
-
-        ctk.CTkLabel(edit_frame, text="Selected Source ID:",
-                      font=ctk.CTkFont(size=13)).pack(padx=20, pady=(10, 5), anchor="w")
-        self.edit_source_id = self._style_field(ctk.CTkEntry(edit_frame, placeholder_text="main",
-                                                             corner_radius=8, height=36))
-        self.edit_source_id.pack(padx=20, pady=5, fill="x")
-        ctk.CTkLabel(edit_frame, text="Name:",
-                      font=ctk.CTkFont(size=13)).pack(padx=20, pady=(10, 5), anchor="w")
-        self.edit_name = self._style_field(ctk.CTkEntry(edit_frame, placeholder_text="my fork",
-                                                        corner_radius=8, height=36))
-        self.edit_name.pack(padx=20, pady=5, fill="x")
-        ctk.CTkLabel(edit_frame, text="Repo URL:",
-                      font=ctk.CTkFont(size=13)).pack(padx=20, pady=(10, 5), anchor="w")
-        self.edit_url = self._style_field(ctk.CTkEntry(edit_frame, placeholder_text="https://github.com/...",
-                                                       corner_radius=8, height=36))
-        self.edit_url.pack(padx=20, pady=5, fill="x")
-        ctk.CTkLabel(edit_frame, text="Branch:",
-                      font=ctk.CTkFont(size=13)).pack(padx=20, pady=(10, 5), anchor="w")
-        self.edit_branch = self._style_field(ctk.CTkEntry(edit_frame, placeholder_text="master",
-                                                          corner_radius=8, height=36))
-        self.edit_branch.pack(padx=20, pady=(5, 15), fill="x")
+        self.sources_table = ctk.CTkScrollableFrame(frame, corner_radius=8, fg_color="#0d131d")
+        self.sources_table.pack(fill="both", expand=True, padx=25, pady=8)
+        self._update_sources_list()
 
     # ─── Profiles Tab ────────────────────────────────────────────────
 
@@ -564,11 +652,6 @@ class BuildAssistantApp(ctk.CTk):
         ctk.CTkLabel(frame, text="Build Profiles", font=ctk.CTkFont(size=24, weight="bold")).pack(
             padx=25, pady=(20, 10), anchor="w")
 
-        self.profiles_listbox = self._style_textbox(ctk.CTkTextbox(frame, height=250, font=ctk.CTkFont(size=12),
-                                                                   corner_radius=8))
-        self.profiles_listbox.pack(fill="both", expand=True, padx=25, pady=8)
-        self._update_profiles_list()
-
         btn_frame = self._card(frame)
         btn_frame.pack(fill="x", padx=25, pady=8)
 
@@ -577,39 +660,10 @@ class BuildAssistantApp(ctk.CTk):
                        corner_radius=8, height=36,
                        fg_color=BLUE, hover_color=BLUE_HOVER).pack(
             side="left", padx=10, pady=15)
-        ctk.CTkButton(btn_frame, text="Delete Profile",
-                       command=self.delete_selected_profile,
-                       corner_radius=8, height=36,
-                       fg_color=DANGER, hover_color=DANGER_HOVER).pack(
-            side="left", padx=10, pady=15)
-        ctk.CTkButton(btn_frame, text="Apply Profile",
-                       command=self.apply_profile,
-                       corner_radius=8, height=36).pack(
-            side="left", padx=10, pady=15)
 
-        edit_frame = self._card(frame)
-        edit_frame.pack(fill="x", padx=25, pady=8)
-
-        ctk.CTkLabel(edit_frame, text="Profile Name:",
-                      font=ctk.CTkFont(size=13)).pack(padx=20, pady=(10, 5), anchor="w")
-        self.edit_profile_name = self._style_field(ctk.CTkEntry(edit_frame, placeholder_text="My Profile",
-                                                                corner_radius=8, height=36))
-        self.edit_profile_name.pack(padx=20, pady=5, fill="x")
-        ctk.CTkLabel(edit_frame, text="Source ID:",
-                      font=ctk.CTkFont(size=13)).pack(padx=20, pady=(10, 5), anchor="w")
-        self.edit_profile_source = self._style_field(ctk.CTkEntry(edit_frame, placeholder_text="main",
-                                                                  corner_radius=8, height=36))
-        self.edit_profile_source.pack(padx=20, pady=5, fill="x")
-        ctk.CTkLabel(edit_frame, text="Build Type:",
-                      font=ctk.CTkFont(size=13)).pack(padx=20, pady=(10, 5), anchor="w")
-        self.edit_profile_type = self._style_combo(ctk.CTkComboBox(edit_frame, values=BUILD_TYPES,
-                                                                   corner_radius=8, height=36))
-        self.edit_profile_type.pack(padx=20, pady=5, fill="x")
-        ctk.CTkLabel(edit_frame, text="CMake Flags (comma-separated):",
-                      font=ctk.CTkFont(size=13)).pack(padx=20, pady=(10, 5), anchor="w")
-        self.edit_profile_flags = self._style_field(ctk.CTkEntry(edit_frame, placeholder_text="-DGGML_CUDA=ON",
-                                                                 corner_radius=8, height=36))
-        self.edit_profile_flags.pack(padx=20, pady=(5, 15), fill="x")
+        self.profiles_table = ctk.CTkScrollableFrame(frame, corner_radius=8, fg_color="#0d131d")
+        self.profiles_table.pack(fill="both", expand=True, padx=25, pady=8)
+        self._update_profiles_list()
 
     # ─── Update Tab ──────────────────────────────────────────────────
 
@@ -660,49 +714,53 @@ class BuildAssistantApp(ctk.CTk):
         def _check():
             try:
                 report = run_full_check()
-                self.hardware_report = report
-                self.dep_check_results = check_all()
-
-                # Update dashboard
-                cpu = report.get("cpu", {})
-                ram = report.get("ram", {})
-                gpu = report.get("gpu", {})
-
-                self.lbl_cpu.configure(text=f"CPU: {cpu.get('name', 'Unknown')} "
-                                            f"({cpu.get('cores', 0)} cores, {cpu.get('threads', 0)} threads)")
-                self.lbl_ram.configure(text=f"RAM: {ram.get('total_gb', 0)} GB total, "
-                                            f"{ram.get('free_gb', 0)} GB free")
-
-                gpus = gpu.get("gpus", [])
-                if gpus:
-                    gpu_names = ", ".join(g.get("name", "Unknown") for g in gpus)
-                    self.lbl_gpu.configure(text=f"GPU: {gpu_names}")
-                else:
-                    self.lbl_gpu.configure(text="GPU: None detected")
-
-                self.lbl_cuda.configure(text=f"CUDA: {'Available ' + gpu.get('cuda_version', '') if gpu.get('cuda_available') else 'Not available'}")
-                self.lbl_sycl.configure(text=f"SYCL: {'Available' if gpu.get('sycl_available') else 'Not available'}")
-                self.lbl_os.configure(text=f"OS: {report.get('os', 'Unknown')}")
-                self.lbl_disk.configure(text=f"Free Disk: {report.get('free_disk_gb', 0)} GB")
-
-                # Recommendation
-                rec = get_recommendation(report)
-                self.selected_build_type.set(rec)
-                self.lbl_recommendation.configure(
-                    text=f"Recommended: {BUILD_TYPE_DISPLAY.get(rec, rec)} Build "
-                         f"({BUILD_TYPE_FLAGS.get(rec, '')})")
-
-                # Update system tab
-                self._update_system_tab(report)
-
-                # Update status
-                self.status_label.configure(text="Hardware check complete")
+                dep_results = check_all()
+                self._post_ui(lambda: self._apply_hardware_check_results(report, dep_results))
 
             except Exception as e:
-                log_error(f"Hardware check failed: {e}")
-                self.status_label.configure(text="Hardware check failed")
+                err_msg = str(e)
+                log_error(f"Hardware check failed: {err_msg}")
+                self._post_ui(lambda: self.status_label.configure(text="Hardware check failed"))
 
         threading.Thread(target=_check, daemon=True).start()
+
+    def _apply_hardware_check_results(self, report, dep_results):
+        """Apply hardware/dependency results on the Tk main thread."""
+        self.hardware_report = report
+        self.dep_check_results = dep_results
+
+        cpu = report.get("cpu", {})
+        ram = report.get("ram", {})
+        gpu = report.get("gpu", {})
+
+        self.lbl_cpu.configure(text=f"CPU: {cpu.get('name', 'Unknown')} "
+                                    f"({cpu.get('cores', 0)} cores, {cpu.get('threads', 0)} threads)")
+        self.lbl_ram.configure(text=f"RAM: {ram.get('total_gb', 0)} GB total, "
+                                    f"{ram.get('free_gb', 0)} GB free")
+
+        gpus = gpu.get("gpus", [])
+        if gpus:
+            gpu_names = ", ".join(g.get("name", "Unknown") for g in gpus)
+            self.lbl_gpu.configure(text=f"GPU: {gpu_names}")
+        else:
+            self.lbl_gpu.configure(text="GPU: None detected")
+
+        cuda_text = f"Available {gpu.get('cuda_version', '')}" if gpu.get("cuda_available") else "Not available"
+        self.lbl_cuda.configure(text=f"CUDA: {cuda_text}")
+        self.lbl_sycl.configure(text=f"SYCL: {'Available' if gpu.get('sycl_available') else 'Not available'}")
+        self.lbl_os.configure(text=f"OS: {report.get('os', 'Unknown')}")
+        self.lbl_disk.configure(text=f"Free Disk: {report.get('free_disk_gb', 0)} GB")
+
+        rec = get_recommendation(report)
+        selected_profile = (self.selected_profile.get() if self._profile_manually_selected
+                            else self._select_profile_for_build_type(rec))
+        profile_hint = f" -> Profile: {selected_profile}" if selected_profile else ""
+        self.lbl_recommendation.configure(
+            text=f"Recommended: {BUILD_TYPE_DISPLAY.get(rec, rec)} Build "
+                 f"({BUILD_TYPE_FLAGS.get(rec, '')}){profile_hint}")
+
+        self._update_system_tab(report)
+        self.status_label.configure(text="Hardware check complete")
 
     def _update_system_tab(self, report):
         """Update the System Check tab with report data."""
@@ -768,7 +826,23 @@ class BuildAssistantApp(ctk.CTk):
 
     def check_dependencies(self):
         """Check all dependencies and display results."""
-        results = check_all()
+        if self._dependency_check_running:
+            return
+        self._dependency_check_running = True
+
+        def worker():
+            try:
+                results = check_all()
+                self._post_ui(lambda: self._display_dependencies(results))
+            except Exception as exc:
+                log_error(f"Dependency check failed: {exc}")
+            finally:
+                self._post_ui(lambda: setattr(self, "_dependency_check_running", False))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _display_dependencies(self, results):
+        self.dep_check_results = results
         lines = []
         lines.append("=" * 60)
         lines.append("DEPENDENCY CHECK")
@@ -800,7 +874,9 @@ class BuildAssistantApp(ctk.CTk):
     def install_missing_deps(self):
         """Show install dialog for missing dependencies."""
         if not self.dep_check_results:
-            self.dep_check_results = check_all()
+            self.check_dependencies()
+            messagebox.showinfo("Dependencies", "Dependency check started. Please retry when it completes.")
+            return
 
         bt = self.selected_build_type.get()
         missing = get_missing_for_build_type(self.dep_check_results, bt)
@@ -812,7 +888,7 @@ class BuildAssistantApp(ctk.CTk):
 
         # Check platform support
         system = platform.system()
-        if system == "Windows" and not has_winget():
+        if system == "Windows" and not shutil.which("winget"):
             messagebox.showerror("Installation Not Available",
                           "winget was not found.\n"
                           "Automatic installation is not available on this system.\n\n"
@@ -854,34 +930,40 @@ class BuildAssistantApp(ctk.CTk):
         install_log = ctk.CTkTextbox(install_win, height=250, font=ctk.CTkFont(size=10))
         install_log.pack(fill="both", expand=True, padx=15, pady=5)
 
-        def install_callback(line):
-            install_log.insert("end", line + "\n")
+        def append_install_log(text):
+            install_log.insert("end", text)
             install_log.see("end")
+
+        def install_callback(line):
+            self._post_ui(lambda line=line: append_install_log(line + "\n"))
 
         def do_install():
             results = install_missing(missing, callback=install_callback)
             all_ok = all(v[0] for v in results.values())
 
-            install_log.insert("end", "\n" + "=" * 40 + "\n")
             if all_ok:
-                install_log.insert("end", "All installations completed successfully!\n")
-                install_log.insert("end", "Re-checking dependencies...\n")
+                self._post_ui(lambda: append_install_log(
+                    "\n" + "=" * 40 + "\n"
+                    "All installations completed successfully!\n"
+                    "Re-checking dependencies...\n"
+                ))
 
                 # Re-check
                 new_results = check_after_install()
+                status_lines = []
                 for name, info in new_results.items():
                     status = "OK" if info.get("found") else "STILL MISSING"
-                    install_log.insert("end", f"  {name}: {status}\n")
+                    status_lines.append(f"  {name}: {status}")
 
                 self.dep_check_results = new_results
-                self.after(0, self.check_dependencies)
+                self._post_ui(lambda text="\n".join(status_lines): append_install_log(text + "\n"))
+                self._post_ui(self.check_dependencies)
             else:
-                install_log.insert("end", "Some installations failed.\n")
+                failure_lines = ["", "=" * 40, "Some installations failed."]
                 for dep, (success, msg) in results.items():
                     if not success:
-                        install_log.insert("end", f"  {dep}: {msg}\n")
-
-            install_log.see("end")
+                        failure_lines.append(f"  {dep}: {msg}")
+                self._post_ui(lambda text="\n".join(failure_lines): append_install_log(text + "\n"))
 
         threading.Thread(target=do_install, daemon=True).start()
 
@@ -985,61 +1067,56 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
         if not source:
             return
 
-        # Update custom fields
-        if source_id == "custom" or (source.get("repo_url") == "" and source.get("type") == "custom"):
-            self.custom_frame.pack(fill="x", padx=20, pady=5)
-            self.custom_url_entry.configure(state="normal")
-            self.custom_branch_entry.configure(state="normal")
-            if source.get("repo_url"):
-                self.custom_url_entry.delete(0, "end")
-                self.custom_url_entry.insert(0, source["repo_url"])
-            if source.get("branch"):
-                self.custom_branch_entry.delete(0, "end")
-                self.custom_branch_entry.insert(0, source["branch"])
-        else:
-            self.custom_frame.pack_forget()
-
-        # Update source label on dashboard
         self.lbl_current_source.configure(text=source.get("name", source_id))
+
+    def on_profile_changed(self, profile_name):
+        profile = get_profile_by_name(profile_name)
+        if profile:
+            self.selected_build_type.set(profile.get("build_type", "CPU"))
+
+    def _on_manual_profile_changed(self, profile_name):
+        self._profile_manually_selected = True
+        self.on_profile_changed(profile_name)
+
+    def _queue_build_log(self, line):
+        self._build_log_queue.put(line)
+
+    def _flush_build_log(self):
+        lines = []
+        while not self._build_log_queue.empty() and len(lines) < 250:
+            lines.append(self._build_log_queue.get_nowait())
+
+        if lines:
+            self.build_log_text.insert("end", "\n".join(lines) + "\n")
+            line_count = int(self.build_log_text.index("end-1c").split(".")[0])
+            if line_count > 5000:
+                self.build_log_text.delete("1.0", f"{line_count - 5000 + 1}.0")
+            self.build_log_text.see("end")
 
     def start_build(self):
         source_name = self.selected_source.get()
         source_id = self._source_name_to_id.get(source_name, source_name)
         source = get_source_by_id(source_id)
+        profile_name = self.selected_profile.get()
+        profile = get_profile_by_name(profile_name)
 
         if not source:
             messagebox.showerror("Error", f"Source '{source_id}' not found.")
             return
 
+        if not profile:
+            messagebox.showerror("Error", "Please select a valid build profile.")
+            return
+
         # Check URL
         if not source.get("repo_url"):
-            if source_id == "custom":
-                url = self.custom_url_entry.get().strip()
-                if not url:
-                    messagebox.showerror("Error",
-                                  "No repository URL configured.\n"
-                                  "Please enter a valid Git URL.")
-                    return
-                source["repo_url"] = url
-            else:
-                messagebox.showerror("Error",
-                              "No repository URL configured for this build source.\n"
-                              "Please configure a valid Git URL first.")
-                return
-
-        # Check dependencies
-        if not self.dep_check_results:
-            self.dep_check_results = check_all()
-
-        bt = self.selected_build_type.get()
-        missing = get_missing_for_build_type(self.dep_check_results, bt)
-        if missing:
-            missing_names = get_missing_programs_text(missing)
-            messagebox.showerror("Missing Dependencies",
-                          f"The following required programs are missing:\n\n" +
-                          "\n".join(f"- {n}" for n in missing_names) +
-                          "\n\nPlease install them via the Dependencies tab before building.")
+            messagebox.showerror("Error",
+                          "No repository URL configured for this build source.\n"
+                          "Please configure the source in the Sources tab first.")
             return
+
+        bt = profile.get("build_type", "CPU")
+        self.selected_build_type.set(bt)
 
         # Clear log
         self.build_log_text.delete("1.0", "end")
@@ -1048,64 +1125,67 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
         self.build_btn.configure(state="disabled", text="Building...")
         self.status_label.configure(text="Building...")
 
-        # Get custom flags
-        custom_flags_str = self.cmake_flags_entry.get().strip()
-        custom_flags = [f.strip() for f in custom_flags_str.split(",") if f.strip()] if custom_flags_str else []
+        profile_flags = profile.get("cmake_flags", [])
+        update_repo = profile.get("update_repo", self.update_repo_var.get())
+        clean_build = profile.get("clean_build", self.clean_build_var.get())
+        build_ui = self.build_ui_var.get()
 
         def do_build():
             try:
                 start_time = time.time()
 
                 def callback(line):
-                    self.build_log_text.insert("end", line + "\n")
-                    self.build_log_text.see("end")
+                    self._queue_build_log(line)
 
                 success, output, error_msg, binaries = run_build(
                     source_id, bt,
-                    update_repo_flag=self.update_repo_var.get(),
-                    custom_flags=custom_flags,
-                    clean_build=self.clean_build_var.get(),
+                    update_repo_flag=update_repo,
+                    custom_flags=profile_flags,
+                    clean_build=clean_build,
                     callback=callback,
-                    build_ui=self.build_ui_var.get()
+                    build_ui=build_ui
                 )
 
                 duration = time.time() - start_time
 
                 # Save result
-                build_path = os.path.join(ROOT_DIR, "builds",
-                                          f"{source_id.replace('_', '-')}-{bt.lower()}")
+                build_path = get_build_path(source_id, bt)
                 save_build_result(source_id, bt, success, build_path,
                                   binaries, duration, error_msg)
 
                 if success:
-                    self.build_log_text.insert("end", "\n" + "=" * 60 + "\n")
-                    self.build_log_text.insert("end", "BUILD SUCCESSFUL!\n")
-                    self.build_log_text.insert("end", f"Duration: {duration:.1f} seconds\n")
+                    self._queue_build_log("")
+                    self._queue_build_log("=" * 60)
+                    self._queue_build_log("BUILD SUCCESSFUL!")
+                    self._queue_build_log(f"Duration: {duration:.1f} seconds")
                     if binaries:
-                        self.build_log_text.insert("end", f"Binaries: {len(binaries)} found\n")
+                        self._queue_build_log(f"Binaries: {len(binaries)} found")
                         for b in binaries[:10]:
-                            self.build_log_text.insert("end", f"  {b}\n")
-                    self.status_label.configure(text="Build successful!")
+                            self._queue_build_log(f"  {b}")
+                    self._post_ui(lambda: self.status_label.configure(text="Build successful!"))
                 else:
-                    self.build_log_text.insert("end", "\n" + "=" * 60 + "\n")
-                    self.build_log_text.insert("end", "BUILD FAILED!\n")
-                    self.build_log_text.insert("end", f"Error: {error_msg}\n")
+                    self._queue_build_log("")
+                    self._queue_build_log("=" * 60)
+                    self._queue_build_log("BUILD FAILED!")
+                    self._queue_build_log(f"Error: {error_msg}")
 
                     # Show explanation
                     explanation = get_error_explanation(error_msg)
-                    self.build_log_text.insert("end", f"\nCause: {explanation['cause']}\n")
-                    self.build_log_text.insert("end", f"Solution: {explanation['solution']}\n")
-                    self.build_log_text.insert("end", f"Fallback: {explanation['fallback']}\n")
+                    self._queue_build_log("")
+                    self._queue_build_log(f"Cause: {explanation['cause']}")
+                    self._queue_build_log(f"Solution: {explanation['solution']}")
+                    self._queue_build_log(f"Fallback: {explanation['fallback']}")
 
-                    self.status_label.configure(text="Build failed")
+                    self._post_ui(lambda: self.status_label.configure(text="Build failed"))
 
             except Exception as e:
-                self.build_log_text.insert("end", f"\nUnexpected error: {e}\n")
+                self._queue_build_log("")
+                self._queue_build_log(f"Unexpected error: {e}")
                 log_error(f"Build error: {e}")
-                self.status_label.configure(text="Build error")
+                self._post_ui(lambda: self.status_label.configure(text="Build error"))
 
             self.is_building = False
-            self.after(0, lambda: self.build_btn.configure(state="normal", text="Start Build"))
+            self._post_ui(lambda: self.build_btn.configure(state="normal", text="Start Build"))
 
         threading.Thread(target=do_build, daemon=True).start()
 
@@ -1141,60 +1221,99 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
     # ─── Sources Management ──────────────────────────────────────────
 
     def _update_sources_list(self):
-        """Update the sources listbox."""
+        """Update the sources table."""
         sources = load_sources()
-        lines = []
-        for s in sources:
-            exp = "EXPERIMENTAL" if s.get("experimental") else ""
-            lines.append(f"  [{s['id']}] {s['name']} ({s.get('type', 'unknown')}) {exp}")
-            if s.get("repo_url"):
-                lines.append(f"    URL: {s['repo_url']}")
-                lines.append(f"    Branch: {s.get('branch', 'N/A')}")
-            lines.append("")
-        self.sources_listbox.delete("1.0", "end")
-        self.sources_listbox.insert("1.0", "\n".join(lines))
+        for child in self.sources_table.winfo_children():
+            child.destroy()
+
+        columns = [("Name", 2), ("Repository URL", 4), ("Branch", 1), ("Commit", 2), ("Actions", 2)]
+        for col, (text, weight) in enumerate(columns):
+            self.sources_table.grid_columnconfigure(col, weight=weight)
+            ctk.CTkLabel(self.sources_table, text=text,
+                         font=ctk.CTkFont(size=13, weight="bold"),
+                         text_color=TEXT).grid(row=0, column=col, sticky="ew", padx=10, pady=(8, 6))
+
+        if not sources:
+            ctk.CTkLabel(self.sources_table, text="No sources configured.",
+                         text_color=MUTED).grid(row=1, column=0, columnspan=5,
+                                                sticky="w", padx=10, pady=12)
+            return
+
+        for row, source in enumerate(sources, start=1):
+            commit = source.get("commit", "")
+            short_commit = commit[:12] if commit else ""
+            values = [
+                source.get("name", ""),
+                source.get("repo_url", ""),
+                source.get("branch", ""),
+                short_commit,
+            ]
+            for col, value in enumerate(values):
+                ctk.CTkLabel(self.sources_table, text=value or "-",
+                             anchor="w", justify="left",
+                             wraplength=520 if col == 1 else 220).grid(
+                    row=row, column=col, sticky="ew", padx=10, pady=6)
+
+            action_frame = ctk.CTkFrame(self.sources_table, fg_color="transparent")
+            action_frame.grid(row=row, column=4, sticky="e", padx=10, pady=6)
+            ctk.CTkButton(action_frame, text="Edit", width=78, height=30,
+                          corner_radius=8,
+                          command=lambda s=source: self.source_dialog(s)).pack(side="left", padx=(0, 6))
+            ctk.CTkButton(action_frame, text="Delete", width=78, height=30,
+                          corner_radius=8, fg_color=DANGER, hover_color=DANGER_HOVER,
+                          command=lambda s=source: self.delete_source_row(s)).pack(side="left")
 
     def add_source_dialog(self):
         """Show dialog to add a new source."""
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Add Build Source")
-        dialog.geometry("500x350")
+        self.source_dialog()
 
-        ctk.CTkLabel(dialog, text="Add Build Source",
+    def source_dialog(self, source=None):
+        """Show dialog to add or edit a source."""
+        is_edit = source is not None
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Edit Build Source" if is_edit else "Add Build Source")
+        dialog.geometry("560x430")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Edit Build Source" if is_edit else "Add Build Source",
                       font=ctk.CTkFont(size=16, weight="bold")).pack(
             pady=(15, 5))
 
         fields = [
-            ("Name:", "name", "my-fork"),
-            ("Repo URL:", "url", "https://github.com/user/repo"),
-            ("Branch:", "branch", "master"),
-            ("Local Path:", "path", "repos/my-fork"),
+            ("Name:", "name", "my-fork", source.get("name", "") if is_edit else ""),
+            ("Repository URL:", "url", "https://github.com/user/repo", source.get("repo_url", "") if is_edit else ""),
+            ("Branch:", "branch", "master", source.get("branch", "") if is_edit else "master"),
+            ("Pinned Commit (optional):", "commit", "full commit sha", source.get("commit", "") if is_edit else ""),
+            ("Fetch Ref (optional):", "fetch_ref", "pull/17400/head", source.get("fetch_ref", "") if is_edit else ""),
         ]
 
         entries = {}
-        for label, key, placeholder in fields:
+        for label, key, placeholder, value in fields:
             ctk.CTkLabel(dialog, text=label).pack(pady=(5, 0), padx=20, anchor="w")
-            entry = ctk.CTkEntry(dialog, placeholder_text=placeholder)
+            entry = self._style_field(ctk.CTkEntry(dialog, placeholder_text=placeholder, height=34))
+            if value:
+                entry.insert(0, value)
             entry.pack(pady=2, padx=20, fill="x")
             entries[key] = entry
 
-        exp_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(dialog, text="Mark as experimental",
-                         variable=exp_var).pack(pady=5, padx=20, anchor="w")
-
-        def add():
+        def save():
             name = entries["name"].get().strip()
             url = entries["url"].get().strip()
-            branch = entries["branch"].get().strip()
-            path = entries["path"].get().strip()
-            exp = exp_var.get()
+            branch = entries["branch"].get().strip() or "master"
+            commit = entries["commit"].get().strip()
+            fetch_ref = entries["fetch_ref"].get().strip()
 
-            if not name or not url:
-                messagebox.showerror("Error", "Name and Repo URL are required.")
+            if not name or not url or not branch:
+                messagebox.showerror("Error", "Name, Repository URL and Branch are required.")
                 return
 
-            ok, msg = add_source(name, url, branch, path,
-                                 source_type="custom", experimental=exp)
+            if is_edit:
+                ok, msg = edit_source(source.get("id"), name=name, repo_url=url,
+                                      branch=branch, commit=commit, fetch_ref=fetch_ref)
+            else:
+                ok, msg = add_source(name, url, branch, source_type="custom",
+                                     experimental=False, commit=commit, fetch_ref=fetch_ref)
             if ok:
                 self.build_sources = load_sources()
                 self._update_sources_list()
@@ -1203,48 +1322,26 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
             else:
                 messagebox.showerror("Error", msg)
 
-        ctk.CTkButton(dialog, text="Add", command=add).pack(pady=15)
+        ctk.CTkButton(dialog, text="Save" if is_edit else "Add", command=save,
+                      fg_color=BLUE, hover_color=BLUE_HOVER,
+                      corner_radius=8, height=36).pack(pady=18)
 
     def edit_selected_source(self):
         """Edit the selected source."""
-        source_id = self.edit_source_id.get().strip()
-        if not source_id:
-            messagebox.showerror("Error", "Please enter a source ID.")
-            return
-
-        name = self.edit_name.get().strip()
-        url = self.edit_url.get().strip()
-        branch = self.edit_branch.get().strip()
-
-        kwargs = {}
-        if name:
-            kwargs["name"] = name
-        if url:
-            kwargs["repo_url"] = url
-        if branch:
-            kwargs["branch"] = branch
-
-        ok, msg = edit_source(source_id, **kwargs)
-        if ok:
-            self.build_sources = load_sources()
-            self._update_sources_list()
-            self._update_source_combo()
-        else:
-            messagebox.showerror("Error", msg)
+        messagebox.showinfo("Sources", "Use the Edit button in the source row.")
 
     def delete_selected_source(self):
         """Delete the selected source."""
-        source_id = self.edit_source_id.get().strip()
-        if not source_id:
-            messagebox.showerror("Error", "Please enter a source ID.")
-            return
+        messagebox.showinfo("Sources", "Use the Delete button in the source row.")
 
+    def delete_source_row(self, source):
+        source_id = source.get("id")
         if source_id == "main":
             messagebox.showerror("Error", "Cannot delete the main source.")
             return
 
         result = messagebox.askyesno("Confirm Delete",
-                                  f"Delete source '{source_id}'?")
+                                  f"Delete source '{source.get('name', source_id)}'?")
         if not result:
             return
 
@@ -1275,76 +1372,122 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
             self.selected_source.set(default_name)
         elif names:
             self.selected_source.set(names[0])
+        else:
+            self.selected_source.set("")
 
     # ─── Profiles Management ─────────────────────────────────────────
 
     def _update_profiles_list(self):
-        """Update the profiles listbox."""
+        """Update the profiles table."""
         profiles = load_profiles()
-        lines = []
-        for p in profiles:
-            exp = "EXPERIMENTAL" if p.get("experimental") else ""
-            lines.append(f"  [{p['name']}] source={p['source']}, type={p['build_type']} {exp}")
-            lines.append(f"    Flags: {', '.join(p.get('cmake_flags', []))}")
-            lines.append("")
-        self.profiles_listbox.delete("1.0", "end")
-        self.profiles_listbox.insert("1.0", "\n".join(lines))
+        for child in self.profiles_table.winfo_children():
+            child.destroy()
+
+        columns = [("Name", 2), ("Build Type", 1), ("CMake Flags", 4), ("Actions", 2)]
+        for col, (text, weight) in enumerate(columns):
+            self.profiles_table.grid_columnconfigure(col, weight=weight)
+            ctk.CTkLabel(self.profiles_table, text=text,
+                         font=ctk.CTkFont(size=13, weight="bold"),
+                         text_color=TEXT).grid(row=0, column=col, sticky="ew", padx=10, pady=(8, 6))
+
+        if not profiles:
+            ctk.CTkLabel(self.profiles_table, text="No build profiles configured.",
+                         text_color=MUTED).grid(row=1, column=0, columnspan=4,
+                                                sticky="w", padx=10, pady=12)
+            return
+
+        for row, profile in enumerate(profiles, start=1):
+            flags = ", ".join(profile.get("cmake_flags", []))
+            values = [
+                profile.get("name", ""),
+                profile.get("build_type", ""),
+                flags,
+            ]
+            for col, value in enumerate(values):
+                ctk.CTkLabel(self.profiles_table, text=value or "-",
+                             anchor="w", justify="left",
+                             wraplength=520 if col == 2 else 220).grid(
+                    row=row, column=col, sticky="ew", padx=10, pady=6)
+
+            action_frame = ctk.CTkFrame(self.profiles_table, fg_color="transparent")
+            action_frame.grid(row=row, column=3, sticky="e", padx=10, pady=6)
+            ctk.CTkButton(action_frame, text="Edit", width=78, height=30,
+                          corner_radius=8,
+                          command=lambda p=profile: self.profile_dialog(p)).pack(side="left", padx=(0, 6))
+            ctk.CTkButton(action_frame, text="Delete", width=78, height=30,
+                          corner_radius=8, fg_color=DANGER, hover_color=DANGER_HOVER,
+                          command=lambda p=profile: self.delete_profile_row(p)).pack(side="left")
 
     def add_profile_dialog(self):
         """Show dialog to add a profile."""
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Add Build Profile")
-        dialog.geometry("500x300")
+        self.profile_dialog()
 
-        ctk.CTkLabel(dialog, text="Add Build Profile",
+    def profile_dialog(self, profile=None):
+        """Show dialog to add or edit a build profile."""
+        is_edit = profile is not None
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Edit Build Profile" if is_edit else "Add Build Profile")
+        dialog.geometry("560x320")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Edit Build Profile" if is_edit else "Add Build Profile",
                       font=ctk.CTkFont(size=16, weight="bold")).pack(
             pady=(15, 5))
 
-        fields = [
-            ("Name:", "name", "My Profile"),
-            ("Source ID:", "source", "main"),
-            ("Build Type:", "type", "CPU"),
-            ("CMake Flags:", "flags", "-DGGML_NATIVE=ON"),
-        ]
+        ctk.CTkLabel(dialog, text="Name:").pack(pady=(5, 0), padx=20, anchor="w")
+        name_entry = self._style_field(ctk.CTkEntry(dialog, placeholder_text="My Profile", height=34))
+        if is_edit:
+            name_entry.insert(0, profile.get("name", ""))
+        name_entry.pack(pady=2, padx=20, fill="x")
 
-        entries = {}
-        for label, key, placeholder in fields:
-            ctk.CTkLabel(dialog, text=label).pack(pady=(5, 0), padx=20, anchor="w")
-            if key == "type":
-                entry = ctk.CTkComboBox(dialog, values=BUILD_TYPES)
-            else:
-                entry = ctk.CTkEntry(dialog, placeholder_text=placeholder)
-            entry.pack(pady=2, padx=20, fill="x")
-            entries[key] = entry
+        ctk.CTkLabel(dialog, text="Build Type:").pack(pady=(5, 0), padx=20, anchor="w")
+        build_type_combo = self._style_combo(ctk.CTkComboBox(dialog, values=BUILD_TYPES, height=34))
+        build_type_combo.set(profile.get("build_type", "CPU") if is_edit else "CPU")
+        build_type_combo.pack(pady=2, padx=20, fill="x")
 
-        def add():
-            name = entries["name"].get().strip()
-            source = entries["source"].get().strip()
-            build_type = entries["type"].get()
-            flags_str = entries["flags"].get().strip()
+        ctk.CTkLabel(dialog, text="CMake Flags (comma-separated):").pack(pady=(5, 0), padx=20, anchor="w")
+        flags_entry = self._style_field(ctk.CTkEntry(dialog, placeholder_text="-DGGML_CUDA=ON", height=34))
+        if is_edit:
+            flags_entry.insert(0, ", ".join(profile.get("cmake_flags", [])))
+        flags_entry.pack(pady=2, padx=20, fill="x")
+
+        def save():
+            name = name_entry.get().strip()
+            build_type = build_type_combo.get()
+            flags_str = flags_entry.get().strip()
             flags = [f.strip() for f in flags_str.split(",") if f.strip()] if flags_str else []
 
-            if not name or not source:
-                messagebox.showerror("Error", "Name and Source are required.")
+            if not name:
+                messagebox.showerror("Error", "Name is required.")
                 return
 
-            ok, msg = add_profile(name, source, build_type, flags)
+            if is_edit:
+                original_name = profile.get("name")
+                kwargs = {"build_type": build_type, "cmake_flags": flags}
+                if name != original_name:
+                    kwargs["name"] = name
+                ok, msg = edit_profile(original_name, **kwargs)
+            else:
+                ok, msg = add_profile(name, "", build_type, flags)
             if ok:
                 self.build_profiles = load_profiles()
                 self._update_profiles_list()
+                self._update_profile_combo()
                 dialog.destroy()
             else:
                 messagebox.showerror("Error", msg)
 
-        ctk.CTkButton(dialog, text="Add", command=add).pack(pady=15)
+        ctk.CTkButton(dialog, text="Save" if is_edit else "Add", command=save,
+                      fg_color=BLUE, hover_color=BLUE_HOVER,
+                      corner_radius=8, height=36).pack(pady=18)
 
     def delete_selected_profile(self):
         """Delete the selected profile."""
-        name = self.edit_profile_name.get().strip()
-        if not name:
-            messagebox.showerror("Error", "Please enter a profile name.")
-            return
+        messagebox.showinfo("Profiles", "Use the Delete button in the profile row.")
 
+    def delete_profile_row(self, profile):
+        name = profile.get("name")
         result = messagebox.askyesno("Confirm Delete", f"Delete profile '{name}'?")
         if not result:
             return
@@ -1353,40 +1496,40 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
         if ok:
             self.build_profiles = load_profiles()
             self._update_profiles_list()
+            self._update_profile_combo()
         else:
             messagebox.showerror("Error", msg)
 
     def apply_profile(self):
         """Apply a build profile to the current settings."""
-        name = self.edit_profile_name.get().strip()
-        profile = None
-        for p in load_profiles():
-            if p.get("name") == name:
-                profile = p
-                break
+        self.on_profile_changed(self.selected_profile.get())
 
-        if not profile:
-            messagebox.showerror("Error", f"Profile '{name}' not found.")
-            return
+    def _update_profile_combo(self):
+        profiles = load_profiles()
+        names = [p.get("name") for p in profiles if p.get("name")]
+        self._profile_name_to_profile = {p.get("name"): p for p in profiles if p.get("name")}
+        if hasattr(self, "profile_combo"):
+            self.profile_combo.configure(values=names)
+        current = self.selected_profile.get()
+        if current in names:
+            self.on_profile_changed(current)
+        elif names:
+            self.selected_profile.set(names[0])
+            self.on_profile_changed(names[0])
+        else:
+            self.selected_profile.set("")
 
-        profile_source_id = profile.get("source", "main")
-        source_name = profile_source_id
-        for sname, sid in self._source_name_to_id.items():
-            if sid == profile_source_id:
-                source_name = sname
-                break
-        self.selected_source.set(source_name)
-        self.selected_build_type.set(profile.get("build_type", "CPU"))
-
-        flags = profile.get("cmake_flags", [])
-        self.cmake_flags_entry.delete(0, "end")
-        if flags:
-            self.cmake_flags_entry.insert(0, ", ".join(flags))
-
-        self.clean_build_var.set(profile.get("clean_build", True))
-        self.update_repo_var.set(profile.get("update_repo", True))
-
-        self.on_source_changed(source_name)
+    def _select_profile_for_build_type(self, build_type):
+        """Select the first profile matching a recommended build type."""
+        profiles = load_profiles()
+        for profile in profiles:
+            if profile.get("build_type") == build_type and profile.get("name"):
+                name = profile["name"]
+                self.selected_profile.set(name)
+                self.on_profile_changed(name)
+                return name
+        self.selected_build_type.set(build_type)
+        return ""
 
     def export_system_report(self):
         """Export the system report as JSON."""
@@ -1411,7 +1554,7 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
     # ─── Update Logic ────────────────────────────────────────────────
 
     def _get_local_version(self):
-        version_path = os.path.join(ROOT_DIR, "VERSION")
+        version_path = resource_path("VERSION")
         try:
             with open(version_path, "r") as f:
                 return f.read().strip()
@@ -1429,6 +1572,10 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
             return (0, 0, 0, 0)
 
     def check_for_updates(self):
+        if getattr(sys, "frozen", False):
+            import webbrowser
+            webbrowser.open("https://github.com/nextscript/Llama.cpp-Build-Assistant/releases/latest")
+            return
         self.update_btn.configure(state="disabled", text="Checking...")
         self.update_status_lbl.configure(text="Checking for updates...", text_color=MUTED)
 
@@ -1451,7 +1598,7 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                 try:
                     result = subprocess.run(
                         ["git", "rev-parse", "HEAD"],
-                        capture_output=True, text=True, timeout=5, cwd=ROOT_DIR
+                        capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True, timeout=5, cwd=ROOT_DIR
                     )
                     if result.returncode == 0:
                         local_sha = result.stdout.strip()
@@ -1465,14 +1612,14 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                         remote_version = resp_ver.read().decode().strip()
                 except urllib.error.HTTPError as e:
                     if e.code == 403:
-                        self.after(0, lambda: self._update_check_done(False, "Up to date."))
+                        self._post_ui(lambda: self._update_check_done(False, "Up to date."))
                         return
                     raise
 
                 local_version = self._get_local_version()
 
                 if self._parse_version(remote_version) <= self._parse_version(local_version):
-                    self.after(0, lambda: self._update_check_done(False, "Up to date."))
+                    self._post_ui(lambda: self._update_check_done(False, "Up to date."))
                     return
 
                 changed_files = []
@@ -1486,7 +1633,7 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                             compare_data = json.loads(resp_compare.read().decode())
 
                         if compare_data.get("status") == "identical":
-                            self.after(0, lambda: self._update_check_done(False, "Up to date."))
+                            self._post_ui(lambda: self._update_check_done(False, "Up to date."))
                             return
 
                         commits = compare_data.get("commits", [])
@@ -1510,11 +1657,11 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                 if not changed_files:
                     changed_files = ["(see commit history)"]
 
-                self.after(0, lambda: self._show_update_modal(local_version, remote_version, changed_files, commit_msg))
+                self._post_ui(lambda: self._show_update_modal(local_version, remote_version, changed_files, commit_msg))
 
             except Exception as e:
                 err_msg = str(e) if str(e) else type(e).__name__
-                self.after(0, lambda: self._update_check_done(False, f"Update check failed: {err_msg}"))
+                self._post_ui(lambda: self._update_check_done(False, f"Update check failed: {err_msg}"))
 
         threading.Thread(target=_do_check, daemon=True).start()
 
@@ -1600,8 +1747,8 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                 files_to_download = list(changed_files)
 
                 if "(see commit history)" in files_to_download:
-                    self.after(0, lambda: log_text.insert("end", "Could not determine changed files, fetching full file list...\n"))
-                    self.after(0, lambda: log_text.see("end"))
+                    self._post_ui(lambda: log_text.insert("end", "Could not determine changed files, fetching full file list...\n"))
+                    self._post_ui(lambda: log_text.see("end"))
                     try:
                         tree_url = "https://api.github.com/repos/nextscript/Llama.cpp-Build-Assistant/git/trees/main?recursive=1"
                         req_tree = urllib.request.Request(tree_url, headers={
@@ -1615,11 +1762,11 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                             if item["type"] == "blob"
                         ]
                     except Exception as e:
-                        self.after(0, lambda err=e: log_text.insert("end", f"Failed to fetch file list: {err}\n"))
-                        self.after(0, lambda: log_text.see("end"))
-                        self.after(0, lambda: download_btn.configure(state="normal", text="Retry",
+                        self._post_ui(lambda err=e: log_text.insert("end", f"Failed to fetch file list: {err}\n"))
+                        self._post_ui(lambda: log_text.see("end"))
+                        self._post_ui(lambda: download_btn.configure(state="normal", text="Retry",
                                                                       command=do_download))
-                        self.after(0, lambda: cancel_btn.configure(state="normal", text="Close"))
+                        self._post_ui(lambda: cancel_btn.configure(state="normal", text="Close"))
                         return
 
                 total = len(files_to_download)
@@ -1627,8 +1774,8 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                 fail_count = 0
 
                 for i, filename in enumerate(files_to_download, 1):
-                    self.after(0, lambda fn=filename, idx=i: log_text.insert("end", f"[{idx}/{total}] Downloading: {fn}...\n"))
-                    self.after(0, lambda: log_text.see("end"))
+                    self._post_ui(lambda fn=filename, idx=i: log_text.insert("end", f"[{idx}/{total}] Downloading: {fn}...\n"))
+                    self._post_ui(lambda: log_text.see("end"))
 
                     try:
                         file_api = f"https://api.github.com/repos/nextscript/Llama.cpp-Build-Assistant/contents/{filename}?ref=main"
@@ -1649,24 +1796,24 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                             f.write(content)
 
                         success_count += 1
-                        self.after(0, lambda fn=filename: log_text.insert("end", f"  -> OK: {fn}\n"))
-                        self.after(0, lambda: log_text.see("end"))
+                        self._post_ui(lambda fn=filename: log_text.insert("end", f"  -> OK: {fn}\n"))
+                        self._post_ui(lambda: log_text.see("end"))
 
                     except Exception as e:
                         fail_count += 1
-                        self.after(0, lambda fn=filename, err=e: log_text.insert("end", f"  -> FAILED: {fn} ({err})\n"))
-                        self.after(0, lambda: log_text.see("end"))
+                        self._post_ui(lambda fn=filename, err=e: log_text.insert("end", f"  -> FAILED: {fn} ({err})\n"))
+                        self._post_ui(lambda: log_text.see("end"))
 
                     time.sleep(0.2)
 
-                self.after(0, lambda: log_text.insert("end", "\n" + "=" * 50 + "\n"))
-                self.after(0, lambda: log_text.insert("end", f"Update complete: {success_count} succeeded, {fail_count} failed.\n"))
-                self.after(0, lambda: log_text.insert("end", "\nPlease restart the application to apply changes.\n"))
-                self.after(0, lambda: log_text.see("end"))
+                self._post_ui(lambda: log_text.insert("end", "\n" + "=" * 50 + "\n"))
+                self._post_ui(lambda: log_text.insert("end", f"Update complete: {success_count} succeeded, {fail_count} failed.\n"))
+                self._post_ui(lambda: log_text.insert("end", "\nPlease restart the application to apply changes.\n"))
+                self._post_ui(lambda: log_text.see("end"))
 
-                self.after(0, lambda: download_btn.configure(state="normal", text="Restart Now",
+                self._post_ui(lambda: download_btn.configure(state="normal", text="Restart Now",
                                                               command=lambda: self._restart_app(modal)))
-                self.after(0, lambda: cancel_btn.configure(state="normal", text="Close"))
+                self._post_ui(lambda: cancel_btn.configure(state="normal", text="Close"))
 
             threading.Thread(target=_download_worker, daemon=True).start()
 
@@ -1685,5 +1832,7 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
 # ─── Entry Point ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     app = BuildAssistantApp()
     app.mainloop()

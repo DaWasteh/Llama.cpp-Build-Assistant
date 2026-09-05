@@ -4,13 +4,10 @@
 # Usage:
 #   .\build_llamacpp.ps1 -Source main -BuildType CPU
 #   .\build_llamacpp.ps1 -Source turboquant -BuildType CUDA
-#   .\build_llamacpp.ps1 -Source prismml_ternary -BuildType Vulkan
+#   .\build_llamacpp.ps1 -Source ternary_bonsai -BuildType Vulkan
 
 param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet("main", "turboquant", "turboquant_3_4", "prismml_ternary", 
-                 "ocr_llama", 
-                 "luce", "dflash", "dspark")]
     [string]$Source,
     
     [Parameter(Mandatory=$true)]
@@ -18,33 +15,35 @@ param(
     [string]$BuildType,
     
     [string]$InstallDir = "",
+    [string]$BuildDir = "",
+    [string]$DepsDir = "",
     [int]$ParallelJobs = 12,
     [switch]$BuildUi,
     [switch]$Update,
     [switch]$CleanBuild,
-    [string]$ExtraFlags = ""
+    [string]$ExtraFlags = "",
+    [string]$RepoUrl = "",
+    [string]$RepoBranch = "",
+    [string]$DirSuffix = "",
+    [string]$SourceCommit = "",
+    [string]$FetchRef = "",
+    [int]$RepoPr = 0,
+    [switch]$RepoSubmodules
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
 
+# Directory containing this script (needed for the deps/ cache even when
+# InstallDir is passed explicitly by the GUI).
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
 # Set default install directory to builds folder in script directory
 if ([string]::IsNullOrEmpty($InstallDir)) {
-    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
     $InstallDir = Join-Path $scriptDir "builds"
 }
-
-# Check for admin rights
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-$useWinget = $false
-if (-not $isAdmin) {
-    Write-Host "INFO: Not running as Administrator. Using winget instead of Chocolatey where possible." -ForegroundColor Yellow
-    if (Is-Available "winget") {
-        $useWinget = $true
-        OK "winget available - will use it for installations"
-    } else {
-        WARN "Neither Admin nor winget available. Some installations may fail."
-    }
+if ([string]::IsNullOrEmpty($DepsDir)) {
+    $DepsDir = Join-Path $scriptDir "deps"
 }
 
 # --- SOURCE CONFIGURATION ---
@@ -56,15 +55,10 @@ $sourceConfig = @{
     }
     "turboquant" = @{
         Url = "https://github.com/TheTom/llama-cpp-turboquant.git"
-        Branch = "feature/turboquant-kv-cache"
+        Branch = "master"
         Suffix = "turboquant.cpp"
     }
-    "turboquant_3_4" = @{
-        Url = "https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git"
-        Branch = "feature/turboquant-kv-cache"
-        Suffix = "turboquant_3_4.cpp"
-    }
-    "prismml_ternary" = @{
+    "ternary_bonsai" = @{
         Url = "https://github.com/PrismML-Eng/llama.cpp.git"
         Branch = "prism"
         Suffix = "prismml.cpp"
@@ -75,30 +69,24 @@ $sourceConfig = @{
         PR = 17400
         Suffix = "ocr_llama.cpp"
     }
-    "luce" = @{
-        Url = "https://github.com/Luce-Org/lucebox-hub.git"
-        Branch = "main"
-        Submodules = $true
-        Suffix = "luce.cpp"
-    }
-    "dflash" = @{
-        Url = "https://github.com/Anbeeld/beellama.cpp.git"
-        Branch = "main"
-        Suffix = "dflash.cpp"
-    }
-    "dspark" = @{
-        Url = "https://github.com/Anbild/beellama.cpp.git"
-        Branch = "main"
-        Suffix = "dspark.cpp"
+    "diffusion_gemma" = @{
+        Url = "https://github.com/ggml-org/llama.cpp.git"
+        Branch = "master"
+        PR = 24427
+        Suffix = "diffusion_gemma.cpp"
     }
 }
 
 $config = $sourceConfig[$Source]
-$REPO_URL = $config.Url
-$REPO_BRANCH = $config.Branch
-$DIR_SUFFIX = $config.Suffix
-$REPO_PR = $config.PR            # PR number for PR-based sources (e.g. 24427)
-$REPO_SUBMODULES = $config.Submodules  # $true to clone with --recurse-submodules
+if (-not $config -and [string]::IsNullOrWhiteSpace($RepoUrl)) {
+    Write-Host "Unknown source '$Source' and no repository URL was provided." -ForegroundColor Red
+    exit 1
+}
+$REPO_URL = if ($RepoUrl) { $RepoUrl } else { $config.Url }
+$REPO_BRANCH = if ($RepoBranch) { $RepoBranch } else { $config.Branch }
+$DIR_SUFFIX = if ($DirSuffix) { $DirSuffix } elseif ($config) { $config.Suffix } else { $Source }
+$REPO_PR = if ($RepoPr -gt 0) { $RepoPr } elseif ($config) { $config.PR } else { $null }
+$REPO_SUBMODULES = if ($RepoSubmodules) { $true } elseif ($config) { $config.Submodules } else { $false }
 
 # Metal is a macOS-only backend. Bail out early with guidance on Windows.
 if ($BuildType -eq "Metal") {
@@ -148,15 +136,38 @@ function Move-PathWithRetry {
         [int]$DelayMs = 500
     )
 
+    $sourceFull = [System.IO.Path]::GetFullPath($Source)
+    $destinationFull = [System.IO.Path]::GetFullPath($Destination)
+    $sourceParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $sourceFull))
+    $destinationParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $destinationFull))
+
     for ($i = 1; $i -le $Retries; $i++) {
         try {
-            Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            if ($sourceParent -eq $destinationParent) {
+                Rename-Item -LiteralPath $sourceFull -NewName (Split-Path -Leaf $destinationFull) -ErrorAction Stop
+            } else {
+                Move-Item -LiteralPath $sourceFull -Destination $destinationFull -Force -ErrorAction Stop
+            }
             return
         } catch {
-            if ($i -eq $Retries) { throw }
+            if ($i -eq $Retries) { break }
             WARN "Could not move '$Source' to '$Destination' yet (attempt $i/$Retries): $($_.Exception.Message)"
             Start-Sleep -Milliseconds $DelayMs
         }
+    }
+
+    WARN "Move failed after $Retries attempts; falling back to robocopy."
+    New-Item -ItemType Directory -Path $destinationFull -Force | Out-Null
+    $robocopyArgs = @($sourceFull, $destinationFull, "/MIR", "/COPY:DAT", "/DCOPY:DAT", "/R:5", "/W:1", "/NFL", "/NDL", "/NP")
+    & robocopy @robocopyArgs | Out-Null
+    $code = $LASTEXITCODE
+    if ($code -gt 7) {
+        throw "robocopy fallback failed with exit code $code while copying '$sourceFull' to '$destinationFull'."
+    }
+    try {
+        Remove-PathWithRetry $sourceFull -Retries 12 -DelayMs $DelayMs
+    } catch {
+        WARN "Copied to '$Destination', but cleanup of temporary directory '$Source' is still blocked: $($_.Exception.Message)"
     }
 }
 
@@ -174,6 +185,19 @@ function Add-ToPath($p) {
 
 function Is-Available($cmd) {
     return [bool](Get-Command $cmd -ErrorAction SilentlyContinue)
+}
+
+# Check for admin rights after helper functions are available.
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$useWinget = $false
+if (-not $isAdmin) {
+    Write-Host "INFO: Not running as Administrator. Using winget instead of Chocolatey where possible." -ForegroundColor Yellow
+    if (Is-Available "winget") {
+        $useWinget = $true
+        OK "winget available - will use it for installations"
+    } else {
+        WARN "Neither Admin nor winget available. Some installations may fail."
+    }
 }
 
 function Get-SystemCmake {
@@ -338,19 +362,22 @@ function Build-SpirvHeaders {
     }
 
     Log "Building SPIRV-Headers from source (RDNA4 / recent Vulkan support)"
+    # IMPORTANT: route native command output to the host (Out-Host). Anything
+    # written to the success stream inside this function would be captured by
+    # "$spirvPrefix = Build-SpirvHeaders ..." and corrupt the returned path.
     if (-not (Test-Path $spirvSrc)) {
-        git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git $spirvSrc
+        git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git $spirvSrc | Out-Host
     }
     New-Item -ItemType Directory -Path $spirvBld -Force | Out-Null
 
     $gen = Get-VsGenerator
     $cfgFlags = @("-S", $spirvSrc, "-B", $spirvBld, "-G", $gen, "-A", "x64",
                   "-DCMAKE_INSTALL_PREFIX=$spirvInst")
-    & $CMAKE_EXE @cfgFlags
+    & $CMAKE_EXE @cfgFlags | Out-Host
     if ($LASTEXITCODE -ne 0) { WARN "SPIRV-Headers configure failed"; return $null }
-    & $CMAKE_EXE --build $spirvBld --config Release
+    & $CMAKE_EXE --build $spirvBld --config Release | Out-Host
     if ($LASTEXITCODE -ne 0) { WARN "SPIRV-Headers build failed"; return $null }
-    & $CMAKE_EXE --install $spirvBld --config Release
+    & $CMAKE_EXE --install $spirvBld --config Release | Out-Host
     if ($LASTEXITCODE -ne 0) { WARN "SPIRV-Headers install failed"; return $null }
 
     OK "SPIRV-Headers installed to $spirvInst"
@@ -676,7 +703,7 @@ if ($BuildType -eq "Vulkan") {
     # RDNA4 (Radeon RX 9000) needs SPIRV-Headers newer than the Vulkan SDK
     # ships. Build them from source once (cached under deps/) and feed the
     # install prefix to CMake via CMAKE_PREFIX_PATH.
-    $spirvPrefix = Build-SpirvHeaders -DepsDir (Join-Path $scriptDir "deps")
+    $spirvPrefix = Build-SpirvHeaders -DepsDir $DepsDir
 }
 
 # --- 6b. SYCL / Intel oneAPI (only if BuildType = SYCL) ---
@@ -852,7 +879,16 @@ if ($existingDir) {
     if ($Update) {
         Log "Updating existing checkout: $dir"
         Push-Location $dir
-        if ($REPO_PR) {
+        if ($SourceCommit) {
+            git fetch --all --prune
+            if ($LASTEXITCODE -ne 0) { WARN "git fetch failed"; Pop-Location; exit 1 }
+            if ($FetchRef) {
+                git fetch --force origin $FetchRef
+                if ($LASTEXITCODE -ne 0) { WARN "git fetch ref '$FetchRef' failed"; Pop-Location; exit 1 }
+            }
+            git checkout --detach $SourceCommit
+            if ($LASTEXITCODE -ne 0) { WARN "git checkout commit '$SourceCommit' failed"; Pop-Location; exit 1 }
+        } elseif ($REPO_PR) {
             git fetch --force origin "pull/$REPO_PR/head:pr$REPO_PR"
             if ($LASTEXITCODE -ne 0) { WARN "git fetch PR #$REPO_PR failed"; Pop-Location; exit 1 }
             git checkout "pr$REPO_PR"
@@ -876,7 +912,26 @@ if ($existingDir) {
     $tmpDir = Join-Path $InstallDir "_tmp_$Source"
     if (Test-Path -LiteralPath $tmpDir) { Remove-PathWithRetry $tmpDir }
 
-    if ($REPO_PR) {
+    if ($SourceCommit) {
+        Log "Cloning pinned source from $REPO_URL"
+        git clone $REPO_URL $tmpDir
+        if ($LASTEXITCODE -ne 0) { WARN "git clone failed"; exit 1 }
+        if ($FetchRef) {
+            git -C $tmpDir fetch --force origin $FetchRef
+            if ($LASTEXITCODE -ne 0) { WARN "git fetch ref '$FetchRef' failed"; exit 1 }
+        }
+        git -C $tmpDir checkout --detach $SourceCommit
+        if ($LASTEXITCODE -ne 0) { WARN "git checkout commit '$SourceCommit' failed"; exit 1 }
+        Push-Location $tmpDir
+        if ($REPO_SUBMODULES) {
+            git submodule update --init --recursive
+            if ($LASTEXITCODE -ne 0) { WARN "git submodule update failed"; Pop-Location; exit 1 }
+        }
+        $desc = git describe --tags --always 2>$null
+        $ver  = [regex]::Match($desc, 'b\d+').Value
+        if (-not $ver) { $ver = "pinned_$($SourceCommit.Substring(0, [Math]::Min(9, $SourceCommit.Length)))" }
+        Pop-Location
+    } elseif ($REPO_PR) {
         # PR-based source: clone the base repo, then fetch the pull request
         # ref into a local branch and check it out.
         Log "Fetching PR #$REPO_PR from $REPO_URL"
@@ -916,11 +971,15 @@ if ($existingDir) {
 
 # --- 9. CMAKE CONFIGURE ---
 Log "CMake configuration ($BuildType)"
-$buildDir = Join-Path $dir "build"
+if ([string]::IsNullOrEmpty($BuildDir)) {
+    $buildDir = Join-Path $dir "build"
+} else {
+    $buildDir = $BuildDir
+}
 
 if ($CleanBuild -and (Test-Path $buildDir)) {
     Log "Deleting old build directory (clean build)..."
-    Remove-Item $buildDir -Recurse -Force
+    Remove-PathWithRetry $buildDir
 }
 
 # Create build directory (if it was removed or never existed)

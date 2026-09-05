@@ -1,10 +1,10 @@
 """
 Profile manager module.
-Manages build profiles (pre-configured source + build type + flags combinations).
+Manages build profiles (build type + CMake flags combinations).
 """
 import json
 import os
-from config import PROFILES_FILE, DEFAULT_BUILD_PROFILES
+from config import PROFILES_FILE
 
 
 def load_profiles():
@@ -13,12 +13,23 @@ def load_profiles():
         try:
             with open(PROFILES_FILE, "r") as f:
                 data = json.load(f)
-                if isinstance(data, list) and len(data) > 0:
-                    return data
+                if isinstance(data, list):
+                    normalized = []
+                    changed = False
+                    for profile in data:
+                        if isinstance(profile, dict):
+                            clean_profile = dict(profile)
+                            if "source" in clean_profile:
+                                clean_profile.pop("source", None)
+                                changed = True
+                            normalized.append(clean_profile)
+                    if changed:
+                        save_profiles(normalized)
+                    return normalized
         except Exception:
             pass
-    save_profiles(DEFAULT_BUILD_PROFILES)
-    return DEFAULT_BUILD_PROFILES.copy()
+    save_profiles([])
+    return []
 
 
 def save_profiles(profiles):
@@ -28,15 +39,16 @@ def save_profiles(profiles):
         json.dump(profiles, f, indent=2)
 
 
-def add_profile(name, source, build_type, cmake_flags=None,
+def add_profile(name, source="", build_type="CPU", cmake_flags=None,
                 clean_build=True, update_repo=True, test_after_build=False,
                 experimental=False):
     """Add a new build profile."""
     profiles = load_profiles()
+    if any(p.get("name") == name for p in profiles):
+        return False, "Profile with this name already exists"
 
     new_profile = {
         "name": name,
-        "source": source,
         "build_type": build_type,
         "cmake_flags": cmake_flags or [],
         "clean_build": clean_build,
@@ -91,4 +103,4 @@ def get_profile_names():
 if __name__ == "__main__":
     profiles = load_profiles()
     for p in profiles:
-        print(f"  {p['name']}: {p['source']} + {p['build_type']}")
+        print(f"  {p['name']}: {p['build_type']}")

@@ -15,6 +15,14 @@ set -euo pipefail
 SOURCE=""
 BUILD_TYPE=""
 INSTALL_DIR=""
+BUILD_DIR_ARG=""
+REPO_URL_ARG=""
+REPO_BRANCH_ARG=""
+DIR_SUFFIX_ARG=""
+SOURCE_COMMIT_ARG=""
+FETCH_REF_ARG=""
+REPO_PR_ARG=""
+REPO_SUB_ARG=0
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
 BUILD_UI=0
 UPDATE_REPO=0
@@ -23,12 +31,11 @@ EXTRA_FLAGS=()
 
 usage() {
     cat <<EOF
-Usage: $0 -s SOURCE -t TYPE [-d INSTALL_DIR] [-j JOBS] [-u] [-U] [-c] [-F FLAGS]
-  -s SOURCE      main|turboquant|turboquant_3_4|prismml_ternary|
-                 ocr_llama|
-                 luce|dflash|dspark
+Usage: $0 -s SOURCE -t TYPE [-d INSTALL_DIR] [-B BUILD_DIR] [-j JOBS] [-u] [-U] [-c] [-F FLAGS]
+  -s SOURCE      main|turboquant|ternary_bonsai|ocr_llama|diffusion_gemma
   -t TYPE        CPU|CUDA|Vulkan|HIP|SYCL|Metal
-  -d INSTALL_DIR build output dir (default: ./builds)
+  -d INSTALL_DIR dir holding the source checkout (default: ./builds)
+  -B BUILD_DIR   CMake build/output dir (default: <checkout>/build)
   -j JOBS        parallel jobs (default: nproc)
   -u             build the web UI (needs npm)
   -U             update the existing checkout (git fetch + reset)
@@ -38,16 +45,24 @@ EOF
     exit 1
 }
 
-while getopts ":s:t:d:j:uUcF:" opt; do
+while getopts ":s:t:d:B:j:uUcF:r:b:o:x:f:p:m" opt; do
     case "$opt" in
         s) SOURCE="$OPTARG" ;;
         t) BUILD_TYPE="$OPTARG" ;;
         d) INSTALL_DIR="$OPTARG" ;;
+        B) BUILD_DIR_ARG="$OPTARG" ;;
         j) JOBS="$OPTARG" ;;
         u) BUILD_UI=1 ;;
         U) UPDATE_REPO=1 ;;
         c) CLEAN_BUILD=1 ;;
         F) while IFS= read -r _line; do [[ -n "$_line" ]] && EXTRA_FLAGS+=("$_line"); done <<< "$OPTARG" ;;
+        r) REPO_URL_ARG="$OPTARG" ;;
+        b) REPO_BRANCH_ARG="$OPTARG" ;;
+        o) DIR_SUFFIX_ARG="$OPTARG" ;;
+        x) SOURCE_COMMIT_ARG="$OPTARG" ;;
+        f) FETCH_REF_ARG="$OPTARG" ;;
+        p) REPO_PR_ARG="$OPTARG" ;;
+        m) REPO_SUB_ARG=1 ;;
         *) usage ;;
     esac
 done
@@ -99,20 +114,18 @@ declare -A SRC_URL SRC_BRANCH SRC_PR SRC_SUB SRC_SUFFIX
 cfg() { SRC_URL["$1"]="$2"; SRC_BRANCH["$1"]="$3"; SRC_PR["$1"]="$4"; SRC_SUB["$1"]="$5"; SRC_SUFFIX["$1"]="$6"; }
 
 cfg main                   "https://github.com/ggml-org/llama.cpp.git"            "master"                       ""  0 "llama.cpp"
-cfg turboquant             "https://github.com/TheTom/llama-cpp-turboquant.git"   "feature/turboquant-kv-cache"  ""  0 "turboquant.cpp"
-cfg turboquant_3_4         "https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git" "feature/turboquant-kv-cache" "" 0 "turboquant_3_4.cpp"
-cfg prismml_ternary        "https://github.com/PrismML-Eng/llama.cpp.git"         "prism"                        ""  0 "prismml.cpp"
+cfg turboquant             "https://github.com/TheTom/llama-cpp-turboquant.git"   "master"                       ""  0 "turboquant.cpp"
+cfg ternary_bonsai         "https://github.com/PrismML-Eng/llama.cpp.git"         "prism"                        ""  0 "prismml.cpp"
 cfg ocr_llama              "https://github.com/ggml-org/llama.cpp.git"            "master"                   "17400" 0 "ocr_llama.cpp"
-cfg luce                   "https://github.com/Luce-Org/lucebox-hub.git"          "main"                         ""  1 "luce.cpp"
-cfg dflash                 "https://github.com/Anbild/beellama.cpp.git"           "main"                         ""  0 "dflash.cpp"
-cfg dspark                 "https://github.com/Anbild/beellama.cpp.git"           "main"                         ""  0 "dspark.cpp"
+cfg diffusion_gemma        "https://github.com/ggml-org/llama.cpp.git"            "master"                   "24427" 0 "diffusion_gemma.cpp"
 
-if [[ -z "${SRC_URL[$SOURCE]:-}" ]]; then echo "Unknown source: $SOURCE"; exit 1; fi
-REPO_URL="${SRC_URL[$SOURCE]}"
-REPO_BRANCH="${SRC_BRANCH[$SOURCE]}"
-REPO_PR="${SRC_PR[$SOURCE]}"
-REPO_SUB="${SRC_SUB[$SOURCE]}"
-DIR_SUFFIX="${SRC_SUFFIX[$SOURCE]}"
+if [[ -z "${SRC_URL[$SOURCE]:-}" && -z "$REPO_URL_ARG" ]]; then echo "Unknown source: $SOURCE"; exit 1; fi
+REPO_URL="${REPO_URL_ARG:-${SRC_URL[$SOURCE]:-}}"
+REPO_BRANCH="${REPO_BRANCH_ARG:-${SRC_BRANCH[$SOURCE]:-master}}"
+REPO_PR="${REPO_PR_ARG:-${SRC_PR[$SOURCE]:-}}"
+REPO_SUB="${SRC_SUB[$SOURCE]:-0}"
+if [[ "$REPO_SUB_ARG" == "1" ]]; then REPO_SUB=1; fi
+DIR_SUFFIX="${DIR_SUFFIX_ARG:-${SRC_SUFFIX[$SOURCE]:-$SOURCE}}"
 
 # ── Dependency checks ─────────────────────────────────────────────────────
 log "Checking build prerequisites"
@@ -198,10 +211,18 @@ if [[ -n "$existing" ]]; then
     dir="$existing"
     if [[ "$UPDATE_REPO" == "1" ]]; then
         log "Updating existing checkout: $dir"
-        ( cd "$dir" \
-            && git fetch --all --prune \
-            && git reset --hard "origin/$REPO_BRANCH" \
-            && git clean -fdx -e node_modules )
+        if [[ -n "$SOURCE_COMMIT_ARG" ]]; then
+            ( cd "$dir" \
+                && git fetch --all --prune \
+                && { [[ -z "$FETCH_REF_ARG" ]] || git fetch --force origin "$FETCH_REF_ARG"; } \
+                && git checkout --detach "$SOURCE_COMMIT_ARG" \
+                && git clean -fdx -e node_modules )
+        else
+            ( cd "$dir" \
+                && git fetch --all --prune \
+                && git reset --hard "origin/$REPO_BRANCH" \
+                && git clean -fdx -e node_modules )
+        fi
         ok "Updated to latest '$REPO_BRANCH'"
     else
         ok "Existing directory: $dir (skipping update)"
@@ -209,7 +230,16 @@ if [[ -n "$existing" ]]; then
 else
     tmp="./_tmp_$SOURCE"
     rm -rf "$tmp"
-    if [[ -n "$REPO_PR" ]]; then
+    if [[ -n "$SOURCE_COMMIT_ARG" ]]; then
+        log "Cloning pinned source from $REPO_URL"
+        git clone "$REPO_URL" "$tmp"
+        [[ -n "$FETCH_REF_ARG" ]] && git -C "$tmp" fetch --force origin "$FETCH_REF_ARG"
+        git -C "$tmp" checkout --detach "$SOURCE_COMMIT_ARG"
+        [[ "$REPO_SUB" == "1" ]] && git -C "$tmp" submodule update --init --recursive
+        desc=$(git -C "$tmp" describe --tags --always 2>/dev/null || true)
+        ver=$(echo "$desc" | grep -oE 'b[0-9]+' | head -1 || true)
+        [[ -z "$ver" ]] && ver="pinned_${SOURCE_COMMIT_ARG:0:9}"
+    elif [[ -n "$REPO_PR" ]]; then
         log "Fetching PR #$REPO_PR from $REPO_URL"
         git clone "$REPO_URL" "$tmp"
         git -C "$tmp" fetch origin "pull/${REPO_PR}/head:pr${REPO_PR}"
@@ -241,7 +271,11 @@ if [[ "$BUILD_UI" == "1" ]]; then
 fi
 
 # ── CMake configure + build ───────────────────────────────────────────────
-build_dir="$dir/build"
+if [[ -n "$BUILD_DIR_ARG" ]]; then
+    build_dir="$BUILD_DIR_ARG"
+else
+    build_dir="$dir/build"
+fi
 if [[ "$CLEAN_BUILD" == "1" ]]; then
     rm -rf "$build_dir"
 fi

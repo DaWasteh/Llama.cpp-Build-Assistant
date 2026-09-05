@@ -4,13 +4,32 @@ All paths, URLs, and default settings are defined here.
 """
 import os
 import json
+import sys
+
+# Directory containing the running executable (never depends on the current
+# working directory). For frozen builds this is the folder with the .exe,
+# for source runs it is the project directory.
+_exe_path = getattr(sys, "executable", None) or sys.argv[0]
+EXE_DIR = os.path.dirname(os.path.abspath(_exe_path))
 
 # Root directory of the project
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    BUNDLE_DIR = getattr(sys, "_MEIPASS", EXE_DIR)
+    if sys.platform == "win32":
+        user_data = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
+    elif sys.platform == "darwin":
+        user_data = os.path.expanduser("~/Library/Application Support")
+    else:
+        user_data = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+    ROOT_DIR = os.path.join(user_data, "Llama.cpp-Build-Assistant")
+else:
+    ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+    BUNDLE_DIR = ROOT_DIR
+    EXE_DIR = ROOT_DIR
 
 # Subdirectories
 REPOS_DIR = os.path.join(ROOT_DIR, "repos")
-BUILDS_DIR = os.path.join(ROOT_DIR, "builds")
+BUILDS_DIR = os.path.join(EXE_DIR, "builds")
 LOGS_DIR = os.path.join(ROOT_DIR, "logs")
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 
@@ -19,7 +38,9 @@ for d in [REPOS_DIR, BUILDS_DIR, LOGS_DIR, DATA_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # Data files
-BUILD_SOURCES_FILE = os.path.join(DATA_DIR, "build_sources.json")
+SOURCES_FILE = os.path.join(DATA_DIR, "sources.json")
+LEGACY_BUILD_SOURCES_FILE = os.path.join(DATA_DIR, "build_sources.json")
+BUILD_SOURCES_FILE = SOURCES_FILE
 BUILD_HISTORY_FILE = os.path.join(DATA_DIR, "build_history.json")
 SYSTEM_REPORT_FILE = os.path.join(DATA_DIR, "system_report.json")
 PROFILES_FILE = os.path.join(DATA_DIR, "profiles.json")
@@ -33,7 +54,7 @@ ERROR_LOG_FILE = os.path.join(LOGS_DIR, "error.log")
 DEFAULT_BUILD_SOURCES = [
     {
         "id": "main",
-        "name": "main llama.cpp",
+        "name": "llama.cpp mainline",
         "repo_url": "https://github.com/ggml-org/llama.cpp",
         "branch": "master",
         "local_path": os.path.join(REPOS_DIR, "llama.cpp-main"),
@@ -43,29 +64,21 @@ DEFAULT_BUILD_SOURCES = [
     },
     {
         "id": "turboquant",
-        "name": "turboquant llama.cpp",
+        "name": "TurboQuant KV-cache",
         "repo_url": "https://github.com/TheTom/llama-cpp-turboquant",
-        "branch": "feature/turboquant-kv-cache",
+        "branch": "master",
+        "commit": "df7f5472949ce37cdc6a2155ef6b8836a8c10bac",
         "local_path": os.path.join(REPOS_DIR, "llama-cpp-turboquant"),
         "type": "fork",
         "experimental": True,
         "default_cmake_flags": []
     },
     {
-        "id": "turboquant_3_4",
-        "name": "turboquant 3/4 llama.cpp",
-        "repo_url": "https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant",
-        "branch": "feature/turboquant-kv-cache",
-        "local_path": os.path.join(REPOS_DIR, "llama-cpp-turboquant-3-4"),
-        "type": "custom",
-        "experimental": True,
-        "default_cmake_flags": []
-    },
-    {
-        "id": "prismml_ternary",
-        "name": "PrismML Ternary llama.cpp",
+        "id": "ternary_bonsai",
+        "name": "PrismML Ternary/Bonsai",
         "repo_url": "https://github.com/PrismML-Eng/llama.cpp",
         "branch": "prism",
+        "commit": "e311ed38fe7ab8fb577a5435b049d48b7d040923",
         "local_path": os.path.join(REPOS_DIR, "llama-cpp-prismml-ternary"),
         "type": "fork",
         "experimental": True,
@@ -77,50 +90,23 @@ DEFAULT_BUILD_SOURCES = [
         "repo_url": "https://github.com/ggml-org/llama.cpp",
         "branch": "master",
         "pr": 17400,
+        "fetch_ref": "pull/17400/head",
+        "commit": "95cc5665859b49d7158c5c4abc9943adf109c6d5",
         "local_path": os.path.join(REPOS_DIR, "llama-cpp-ocr"),
         "type": "pr",
         "experimental": True,
         "default_cmake_flags": []
     },
     {
-        "id": "luce",
-        "name": "Luce llama.cpp",
-        "repo_url": "https://github.com/Luce-Org/lucebox-hub",
-        "branch": "main",
-        "submodules": True,
-        "local_path": os.path.join(REPOS_DIR, "llama-cpp-luce"),
-        "type": "fork",
-        "experimental": True,
-        "default_cmake_flags": []
-    },
-    {
-        "id": "dflash",
-        "name": "DFlash llama.cpp",
-        "repo_url": "https://github.com/Anbeeld/beellama.cpp",
-        "branch": "main",
-        "local_path": os.path.join(REPOS_DIR, "llama-cpp-dflash"),
-        "type": "fork",
-        "experimental": True,
-        "default_cmake_flags": []
-    },
-    {
-        "id": "dspark",
-        "name": "DSpark (Spark Attention) llama.cpp",
-        "repo_url": "https://github.com/Anbild/beellama.cpp",
-        "branch": "main",
-        "note": "Spark Attention is a feature inside beellama.cpp (same repo as DFlash); build with Vulkan/CUDA.",
-        "local_path": os.path.join(REPOS_DIR, "llama-cpp-dspark"),
-        "type": "fork",
-        "experimental": True,
-        "default_cmake_flags": []
-    },
-    {
-        "id": "custom",
-        "name": "eigenes llama.cpp Repository",
-        "repo_url": "",
+        "id": "diffusion_gemma",
+        "name": "Diffusion-Gemma PR #24427",
+        "repo_url": "https://github.com/ggml-org/llama.cpp",
         "branch": "master",
-        "local_path": os.path.join(REPOS_DIR, "custom-llama-cpp"),
-        "type": "custom",
+        "pr": 24427,
+        "fetch_ref": "pull/24427/head",
+        "commit": "dd0cf04459b0c4f43aa6667dbc0879ac0cd50323",
+        "local_path": os.path.join(REPOS_DIR, "llama-cpp-diffusion-gemma"),
+        "type": "pr",
         "experimental": True,
         "default_cmake_flags": []
     }
@@ -129,55 +115,154 @@ DEFAULT_BUILD_SOURCES = [
 # Default build profiles
 DEFAULT_BUILD_PROFILES = [
     {
-        "name": "CPU schnell",
-        "source": "main",
+        "name": "CPU",
         "build_type": "CPU",
-        "cmake_flags": ["-DGGML_NATIVE=ON"],
+        "cmake_flags": [
+            "-DGGML_NATIVE=OFF",
+            "-DGGML_AVX2=ON",
+            "-DGGML_AVX_VNNI=ON",
+            "-DGGML_BMI2=ON",
+            "-DGGML_AVX512=OFF",
+            "-DGGML_AVX512_VBMI=OFF",
+            "-DGGML_AVX512_VNNI=OFF",
+            "-DGGML_AVX512_BF16=OFF",
+            "-DGGML_LTO=OFF",
+            "-DBUILD_SHARED_LIBS=OFF",
+            "-DLLAMA_BUILD_SERVER=ON",
+            "-DLLAMA_BUILD_TESTS=OFF",
+            "-DLLAMA_BUILD_TOOLS=ON",
+            "-DLLAMA_BUILD_EXAMPLES=ON",
+            "-DLLAMA_CURL=OFF",
+            "-DGGML_CCACHE=OFF"
+        ],
         "clean_build": True,
         "update_repo": True,
         "test_after_build": False
     },
     {
-        "name": "CUDA NVIDIA empfohlen",
-        "source": "main",
+        "name": "CUDA NVIDIA",
         "build_type": "CUDA",
-        "cmake_flags": ["-DGGML_CUDA=ON"],
+        "cmake_flags": [
+            "-DLLAMA_BUILD_IS_DEV=ON",
+            "-DGGML_CUDA=ON",
+            "-DGGML_VULKAN=OFF",
+            "-DGGML_NATIVE=OFF",
+            "-DGGML_AVX2=ON",
+            "-DGGML_FMA=ON",
+            "-DGGML_F16C=ON",
+            "-DBUILD_SHARED_LIBS=OFF",
+            "-DLLAMA_BUILD_SERVER=ON",
+            "-DLLAMA_BUILD_UI=ON",
+            "-DLLAMA_USE_PREBUILT_UI=ON",
+            "-DLLAMA_CURL=OFF",
+            "-DGGML_CCACHE=OFF"
+        ],
         "clean_build": True,
         "update_repo": True,
         "test_after_build": True
     },
     {
-        "name": "Vulkan kompatibel",
-        "source": "main",
+        "name": "Vulkan",
         "build_type": "Vulkan",
-        "cmake_flags": ["-DGGML_VULKAN=ON"],
+        "cmake_flags": [
+            "-DGGML_VULKAN=ON",
+            "-DGGML_HIP=OFF",
+            "-DGGML_NATIVE=OFF",
+            "-DGGML_AVX2=ON",
+            "-DGGML_AVX_VNNI=ON",
+            "-DGGML_BMI2=ON",
+            "-DGGML_AVX512=OFF",
+            "-DGGML_AVX512_VBMI=OFF",
+            "-DGGML_AVX512_VNNI=OFF",
+            "-DGGML_AVX512_BF16=OFF",
+            "-DGGML_LTO=OFF",
+            "-DBUILD_SHARED_LIBS=OFF",
+            "-DLLAMA_BUILD_SERVER=ON",
+            "-DLLAMA_BUILD_TESTS=OFF",
+            "-DLLAMA_BUILD_TOOLS=ON",
+            "-DLLAMA_BUILD_EXAMPLES=ON",
+            "-DLLAMA_BUILD_UI=ON",
+            "-DLLAMA_USE_PREBUILT_UI=ON",
+            "-DLLAMA_CURL=OFF",
+            "-DGGML_CCACHE=OFF",
+            "-DGGML_VULKAN_CHECK_RESULTS=OFF",
+            "-DGGML_VULKAN_DEBUG=OFF",
+            "-DGGML_VULKAN_MEMORY_DEBUG=OFF",
+            "-DGGML_VULKAN_SHADER_DEBUG_INFO=OFF",
+            "-DGGML_VULKAN_VALIDATE=OFF",
+            "-DGGML_VULKAN_RUN_TESTS=OFF"
+        ],
         "clean_build": True,
         "update_repo": True,
         "test_after_build": False
     },
     {
-        "name": "ROCm AMD",
-        "source": "main",
+        "name": "HIP ROCm AMD",
         "build_type": "HIP",
-        "cmake_flags": ["-DGGML_HIP=ON"],
+        "cmake_flags": [
+            "-DGGML_HIP=ON",
+            "-DGGML_VULKAN=OFF",
+            "-DGPU_TARGETS=gfx1201",
+            "-DGGML_HIP_GRAPHS=ON",
+            "-DGGML_HIP_NO_VMM=ON",
+            "-DGGML_HIP_RCCL=OFF",
+            "-DGGML_CUDA_NO_PEER_COPY=ON",
+            "-DGGML_CUDA_FA=ON",
+            "-DGGML_CUDA_FA_ALL_QUANTS=ON",
+            "-DGGML_FMA=ON",
+            "-DGGML_F16C=ON",
+            "-DGGML_NATIVE=OFF",
+            "-DGGML_AVX2=ON",
+            "-DGGML_AVX_VNNI=ON",
+            "-DGGML_BMI2=ON",
+            "-DGGML_AVX512=OFF",
+            "-DGGML_AVX512_VBMI=OFF",
+            "-DGGML_AVX512_VNNI=OFF",
+            "-DGGML_AVX512_BF16=OFF",
+            "-DGGML_LTO=OFF",
+            "-DBUILD_SHARED_LIBS=OFF",
+            "-DLLAMA_BUILD_SERVER=ON",
+            "-DLLAMA_BUILD_TESTS=OFF",
+            "-DLLAMA_BUILD_TOOLS=ON",
+            "-DLLAMA_BUILD_EXAMPLES=ON",
+            "-DLLAMA_BUILD_UI=ON",
+            "-DLLAMA_USE_PREBUILT_UI=ON",
+            "-DLLAMA_CURL=OFF",
+            "-DGGML_CCACHE=OFF"
+        ],
         "clean_build": True,
         "update_repo": True,
         "test_after_build": False
     },
     {
         "name": "SYCL Intel GPU",
-        "source": "main",
         "build_type": "SYCL",
-        "cmake_flags": ["-DGGML_SYCL=ON"],
+        "cmake_flags": [
+            "-DGGML_SYCL=ON",
+            "-DGGML_SYCL_F16=ON",
+            "-DGGML_NATIVE=ON",
+            "-DBUILD_SHARED_LIBS=ON",
+            "-DLLAMA_BUILD_SERVER=ON",
+            "-DLLAMA_CURL=OFF",
+            "-DGGML_CCACHE=OFF"
+        ],
         "clean_build": True,
         "update_repo": True,
         "test_after_build": False
     },
     {
         "name": "Metal macOS",
-        "source": "main",
         "build_type": "Metal",
-        "cmake_flags": ["-DGGML_METAL=ON", "-DGGML_METAL_EMBED_LIBRARY=ON"],
+        "cmake_flags": [
+            "-DGGML_METAL=ON",
+            "-DGGML_METAL_EMBED_LIBRARY=ON",
+            "-DGGML_CUDA=OFF",
+            "-DGGML_VULKAN=OFF",
+            "-DBUILD_SHARED_LIBS=ON",
+            "-DLLAMA_BUILD_SERVER=ON",
+            "-DLLAMA_CURL=OFF",
+            "-DGGML_CCACHE=OFF"
+        ],
         "clean_build": True,
         "update_repo": True,
         "test_after_build": False
@@ -213,3 +298,12 @@ BUILD_TYPE_DISPLAY = {
 
 # Build types list
 BUILD_TYPES = ["CPU", "CUDA", "Vulkan", "HIP", "SYCL", "Metal"]
+
+if getattr(sys, "frozen", False):
+    from runtime_data import initialize_data
+    initialize_data(DATA_DIR, BUNDLE_DIR, {
+        "sources.json": DEFAULT_BUILD_SOURCES,
+        "profiles.json": DEFAULT_BUILD_PROFILES,
+        "build_history.json": [],
+        "system_report.json": {},
+    })

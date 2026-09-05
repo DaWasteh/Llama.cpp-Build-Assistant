@@ -8,6 +8,10 @@ __pycache__/
 .python-interpreter
 
 # Build outputs and toolchain downloads
+build/
+dist/
+build_assets/
+Llama.cpp-Build-Assistant-*.spec
 builds/
 deps/
 logs/

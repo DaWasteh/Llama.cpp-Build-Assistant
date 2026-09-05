@@ -1,0 +1,60 @@
+[
+  {
+    "id": "main",
+    "name": "llama.cpp mainline",
+    "repo_url": "https://github.com/ggml-org/llama.cpp",
+    "branch": "master",
+    "local_path": "repos/llama.cpp-main",
+    "type": "official",
+    "experimental": false,
+    "default_cmake_flags": []
+  },
+  {
+    "id": "turboquant",
+    "name": "TurboQuant KV-cache",
+    "repo_url": "https://github.com/TheTom/llama-cpp-turboquant",
+    "branch": "master",
+    "commit": "df7f5472949ce37cdc6a2155ef6b8836a8c10bac",
+    "local_path": "repos/llama-cpp-turboquant",
+    "type": "fork",
+    "experimental": true,
+    "default_cmake_flags": []
+  },
+  {
+    "id": "ternary_bonsai",
+    "name": "PrismML Ternary/Bonsai",
+    "repo_url": "https://github.com/PrismML-Eng/llama.cpp",
+    "branch": "prism",
+    "commit": "e311ed38fe7ab8fb577a5435b049d48b7d040923",
+    "local_path": "repos/llama-cpp-prismml-ternary",
+    "type": "fork",
+    "experimental": true,
+    "default_cmake_flags": []
+  },
+  {
+    "id": "ocr_llama",
+    "name": "DeepSeek-OCR PR #17400",
+    "repo_url": "https://github.com/ggml-org/llama.cpp",
+    "branch": "master",
+    "pr": 17400,
+    "fetch_ref": "pull/17400/head",
+    "commit": "95cc5665859b49d7158c5c4abc9943adf109c6d5",
+    "local_path": "repos/llama-cpp-ocr",
+    "type": "pr",
+    "experimental": true,
+    "default_cmake_flags": []
+  },
+  {
+    "id": "diffusion_gemma",
+    "name": "Diffusion-Gemma PR #24427",
+    "repo_url": "https://github.com/ggml-org/llama.cpp",
+    "branch": "master",
+    "pr": 24427,
+    "fetch_ref": "pull/24427/head",
+    "commit": "dd0cf04459b0c4f43aa6667dbc0879ac0cd50323",
+    "local_path": "repos/llama-cpp-diffusion-gemma",
+    "type": "pr",
+    "experimental": true,
+    "default_cmake_flags": []
+  }
+]

@@ -19,7 +19,7 @@ def run_command(cmd, timeout=300):
     """Run a command and return (success, stdout, stderr).
     Handles winget special exit codes as success when appropriate."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
+        result = subprocess.run(cmd, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True,
                                 shell=True, timeout=timeout)
         stdout = result.stdout or ""
         stderr = result.stderr or ""
@@ -65,7 +65,7 @@ def run_privileged(cmd, timeout=300):
         try:
             cached = subprocess.run(
                 [sudo, "-n", "true"],
-                capture_output=True,
+                capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 text=True,
                 timeout=10,
             ).returncode == 0
@@ -99,13 +99,13 @@ def run_privileged(cmd, timeout=300):
 
 def has_winget():
     """Check if winget is available on Windows."""
-    return subprocess.run("winget --version", capture_output=True,
+    return subprocess.run("winget --version", capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                           shell=True, timeout=10).returncode == 0
 
 
 def has_sudo():
     """Check if sudo is available."""
-    return subprocess.run("sudo --version", capture_output=True,
+    return subprocess.run("sudo --version", capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                           shell=True, timeout=10).returncode == 0
 
 

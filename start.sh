@@ -41,7 +41,7 @@ fi
 echo "Using interpreter: $CHOSEN_PY"
 echo ""
 echo "Starting Build Assistant..."
-"$CHOSEN_PY" "$SCRIPT_DIR/app.py"
-
-echo ""
-echo "Application closed."
+mkdir -p "$SCRIPT_DIR/logs"
+nohup "$CHOSEN_PY" "$SCRIPT_DIR/app.py" < /dev/null > "$SCRIPT_DIR/logs/app-launch.log" 2>&1 &
+disown 2>/dev/null || true
+exit 0
