@@ -15,6 +15,27 @@ macOS, Ubuntu and other Linux distros**.
 - **Build Profiles** — pre-configured profiles for quick setup
 - **Live Logs** — real-time build output
 - **Build History** — all build results saved for reference
+- 
+<h2>Screenshots</h2>
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="Screens/screenshot1.PNG" width="100%">
+    </td>
+    <td width="50%">
+      <img src="Screens/screenshot2.PNG" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="Screens/screenshot3.PNG" width="100%">
+    </td>
+    <td width="50%">
+      <img src="Screens/screenshot4.PNG" width="100%">
+    </td>
+  </tr>
+</table>
 
 ## Build Types
 
