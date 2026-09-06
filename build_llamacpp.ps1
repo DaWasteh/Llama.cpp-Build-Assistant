@@ -1,24 +1,32 @@
-﻿# Universal llama.cpp Build Script
+# Universal llama.cpp Build Script (Windows)
 # Supports all sources and build types
 #
 # Usage:
 #   .\build_llamacpp.ps1 -Source main -BuildType CPU
-#   .\build_llamacpp.ps1 -Source turboquant -BuildType CUDA
-#   .\build_llamacpp.ps1 -Source ternary_bonsai -BuildType Vulkan
+#   .\build_llamacpp.ps1 -Source turboquant -BuildType CUDA -CudaMajor 12
+#   .\build_llamacpp.ps1 -Source ternary_bonsai -BuildType Vulkan -CpuTarget native
+#
+# Output: <InstallDir>\<bNNNN>_<backend>_<DirSuffix>\build\bin\Release\llama-server.exe
+# bNNNN is "git rev-list --count HEAD", i.e. exactly the build number that
+# llama-server --version reports, so the folder name never lies.
 
 param(
     [Parameter(Mandatory=$true)]
     [string]$Source,
-    
+
     [Parameter(Mandatory=$true)]
     [ValidateSet("CPU", "CUDA", "Vulkan", "HIP", "SYCL", "Metal")]
     [string]$BuildType,
-    
+
     [string]$InstallDir = "",
     [string]$BuildDir = "",
     [string]$DepsDir = "",
-    [int]$ParallelJobs = 12,
-    [switch]$BuildUi,
+    [int]$ParallelJobs = 0,
+    [ValidateSet("portable", "native")]
+    [string]$CpuTarget = "portable",
+    [string]$CudaMajor = "",
+    [string]$Targets = "",
+    [switch]$BuildUi,   # force LLAMA_BUILD_UI=ON (npm)
     [switch]$Update,
     [switch]$CleanBuild,
     [string]$ExtraFlags = "",
@@ -34,6 +42,13 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
 
+# The GUI reads our output as UTF-8. Make PowerShell emit UTF-8 so umlauts in
+# MSBuild/CMake messages do not turn into mojibake.
+try {
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch {}
+
 # Do not keep MSBuild node processes alive after the build. Lingering nodes
 # hold file handles that prevent cleaning up the checkout afterwards.
 $env:MSBUILDDISABLENODEREUSE = "1"
@@ -42,12 +57,12 @@ $env:MSBUILDDISABLENODEREUSE = "1"
 # InstallDir is passed explicitly by the GUI).
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-# Set default install directory to builds folder in script directory
-if ([string]::IsNullOrEmpty($InstallDir)) {
-    $InstallDir = Join-Path $scriptDir "builds"
-}
-if ([string]::IsNullOrEmpty($DepsDir)) {
-    $DepsDir = Join-Path $scriptDir "deps"
+if ([string]::IsNullOrEmpty($InstallDir)) { $InstallDir = Join-Path $scriptDir "builds" }
+if ([string]::IsNullOrEmpty($DepsDir))    { $DepsDir    = Join-Path $scriptDir "deps" }
+
+if ($ParallelJobs -le 0) {
+    $ParallelJobs = [int]$env:NUMBER_OF_PROCESSORS
+    if ($ParallelJobs -le 0) { $ParallelJobs = 4 }
 }
 
 # --- SOURCE CONFIGURATION ---
@@ -60,12 +75,12 @@ $sourceConfig = @{
     "turboquant" = @{
         Url = "https://github.com/TheTom/llama-cpp-turboquant.git"
         Branch = "master"
-        Suffix = "turboquant.cpp"
+        Suffix = "tq_llama.cpp"
     }
     "ternary_bonsai" = @{
         Url = "https://github.com/PrismML-Eng/llama.cpp.git"
         Branch = "prism"
-        Suffix = "prismml.cpp"
+        Suffix = "2b_llama.cpp"
     }
     "ocr_llama" = @{
         Url = "https://github.com/ggml-org/llama.cpp.git"
@@ -77,7 +92,7 @@ $sourceConfig = @{
         Url = "https://github.com/ggml-org/llama.cpp.git"
         Branch = "master"
         PR = 24427
-        Suffix = "diffusion_gemma.cpp"
+        Suffix = "d_llama.cpp"
     }
 }
 
@@ -88,13 +103,13 @@ if (-not $config -and [string]::IsNullOrWhiteSpace($RepoUrl)) {
 }
 $REPO_URL = if ($RepoUrl) { $RepoUrl } else { $config.Url }
 $REPO_BRANCH = if ($RepoBranch) { $RepoBranch } else { $config.Branch }
-$DIR_SUFFIX = if ($DirSuffix) { $DirSuffix } elseif ($config) { $config.Suffix } else { $Source }
+$DIR_SUFFIX = if ($DirSuffix) { $DirSuffix } elseif ($config) { $config.Suffix } else { "${Source}_llama.cpp" }
 $REPO_PR = if ($RepoPr -gt 0) { $RepoPr } elseif ($config) { $config.PR } else { $null }
 $REPO_SUBMODULES = if ($RepoSubmodules) { $true } elseif ($config) { $config.Submodules } else { $false }
 
 # Metal is a macOS-only backend. Bail out early with guidance on Windows.
 if ($BuildType -eq "Metal") {
-    Write-Host "Metal backend is only available on macOS (Apple Silicon / Intel Macs)." -ForegroundColor Red
+    Write-Host "Metal backend is only available on macOS (Apple Silicon)." -ForegroundColor Red
     Write-Host "On Windows, choose CUDA (NVIDIA), Vulkan, HIP (AMD) or SYCL (Intel) instead." -ForegroundColor Yellow
     exit 1
 }
@@ -104,6 +119,15 @@ if ($BuildType -eq "Metal") {
 $extraFlagList = @()
 if ($ExtraFlags) {
     $extraFlagList = $ExtraFlags -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+}
+$targetList = @()
+if ($Targets) {
+    $targetList = $Targets -split "[,;\s]+" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+}
+
+function Test-ExtraFlag($prefix) {
+    foreach ($f in $extraFlagList) { if ($f -like "$prefix*") { return $true } }
+    return $false
 }
 
 # --- HELPER FUNCTIONS ---
@@ -191,18 +215,23 @@ function Is-Available($cmd) {
     return [bool](Get-Command $cmd -ErrorAction SilentlyContinue)
 }
 
-# Check for admin rights after helper functions are available.
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-$useWinget = $false
-if (-not $isAdmin) {
-    Write-Host "INFO: Not running as Administrator. Using winget instead of Chocolatey where possible." -ForegroundColor Yellow
-    if (Is-Available "winget") {
-        $useWinget = $true
-        OK "winget available - will use it for installations"
-    } else {
-        WARN "Neither Admin nor winget available. Some installations may fail."
+function Invoke-Native {
+    # Run a native command and return its text output without letting stderr
+    # chatter become a terminating error (PowerShell 5.1 + ErrorActionPreference Stop).
+    param([Parameter(Mandatory=$true)][scriptblock]$Command)
+    $prev = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $out = @(& $Command 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { [string]$_.Exception.Message } else { [string]$_ } })
+        $script:LastNativeExit = $LASTEXITCODE
+        return ($out -join "`n").Trim()
+    } finally {
+        $ErrorActionPreference = $prev
     }
 }
+
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$useWinget = $false
 
 function Get-SystemCmake {
     $candidates = Get-Command cmake -All -ErrorAction SilentlyContinue
@@ -212,6 +241,72 @@ function Get-SystemCmake {
         }
     }
     return (Get-Command cmake -ErrorAction SilentlyContinue).Source
+}
+
+function Get-VsWhere {
+    $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vsw) { return $vsw }
+    return $null
+}
+
+function Get-VsInstance {
+    # Newest Visual Studio with the C++ x64 toolset: path, version, generator name.
+    $vsw = Get-VsWhere
+    if (-not $vsw) { return $null }
+    $json = Invoke-Native { & $vsw -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json }
+    if (-not $json) { return $null }
+    try { $inst = @($json | ConvertFrom-Json)[0] } catch { return $null }
+    if (-not $inst) { return $null }
+    $version = [string]$inst.installationVersion
+    $major = [int]($version.Split(".")[0])
+    $generator = switch ($major) {
+        18 { "Visual Studio 18 2026" }
+        17 { "Visual Studio 17 2022" }
+        16 { "Visual Studio 16 2019" }
+        15 { "Visual Studio 15 2017" }
+        14 { "Visual Studio 14 2015" }
+        default { "Visual Studio $major" }
+    }
+    return [PSCustomObject]@{
+        Path = [string]$inst.installationPath
+        Version = $version
+        Major = $major
+        Generator = $generator
+        DisplayName = [string]$inst.displayName
+    }
+}
+
+function Import-VsDevEnvironment {
+    # Import the x64 developer environment (INCLUDE/LIB/PATH) of the given
+    # Visual Studio into this process. Needed for Ninja-based builds (HIP,
+    # SYCL) so clang/icx find the MSVC headers and libraries.
+    param([Parameter(Mandatory=$true)][string]$VsInstallPath)
+    $vsDevCmd = Join-Path $VsInstallPath "Common7\Tools\VsDevCmd.bat"
+    if (-not (Test-Path $vsDevCmd)) { WARN "VsDevCmd.bat not found: $vsDevCmd"; return $false }
+    $rows = & $env:ComSpec /d /s /c "`"$vsDevCmd`" -no_logo -arch=x64 -host_arch=x64 >nul && set"
+    if ($LASTEXITCODE -ne 0) { WARN "VsDevCmd.bat failed with exit code $LASTEXITCODE"; return $false }
+    foreach ($row in $rows) {
+        if ($row -match '^([^=]+)=(.*)$') {
+            Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2]
+        }
+    }
+    OK "Imported Visual Studio x64 build environment"
+    return $true
+}
+
+function Resolve-NinjaPath {
+    # Ninja from PATH, else the copy every Visual Studio ships with its CMake tools.
+    param([string]$VsInstallPath = "")
+    $found = Get-Command ninja -ErrorAction SilentlyContinue
+    if ($found) { return $found.Source }
+    if ($VsInstallPath) {
+        $candidate = Join-Path $VsInstallPath "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+        if (Test-Path $candidate) {
+            Add-ToPath (Split-Path -Parent $candidate)
+            return $candidate
+        }
+    }
+    return $null
 }
 
 function Resolve-OneApiCompilerBin {
@@ -268,7 +363,7 @@ function Copy-SyclRuntimeDlls {
     $src = Resolve-OneApiCompilerBin
     if (-not $src) {
         WARN "Could not locate oneAPI compiler DLL directory."
-        WARN "SYCL runtime DLLs were NOT copied — binaries may fail to start."
+        WARN "SYCL runtime DLLs were NOT copied - binaries may fail to start."
         WARN "Run from the 'Intel oneAPI command prompt', or copy the DLLs from"
         WARN "<oneAPI>\compiler\<version>\bin manually into: $TargetDir"
         return $false
@@ -297,22 +392,6 @@ function Copy-SyclRuntimeDlls {
         WARN "No SYCL runtime DLLs found to copy in $src"
         return $false
     }
-}
-
-function Get-VsGenerator {
-    # Determine the Visual Studio CMake generator for the installed VS.
-    $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (Test-Path $vsw) {
-        $vv = & $vsw -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion 2>$null
-        if ($vv) {
-            $vm = [int]($vv.Split(".")[0])
-            if     ($vm -ge 18) { return "Visual Studio 18 2026" }
-            elseif ($vm -eq 17) { return "Visual Studio 17 2022" }
-            elseif ($vm -eq 16) { return "Visual Studio 16 2019" }
-            elseif ($vm -eq 15) { return "Visual Studio 15 2017" }
-        }
-    }
-    return "Visual Studio 17 2022"
 }
 
 function Resolve-MsvcClPath {
@@ -349,19 +428,24 @@ function Build-SpirvHeaders {
     # RDNA4 (Radeon RX 9000) requires a very recent SPIRV-Headers (shipped with
     # SPV_KHR_cooperative_matrix etc.) that is usually newer than the Vulkan
     # SDK's bundled copy. The install dir is cached, so this only runs once.
-    param([Parameter(Mandatory=$true)][string]$DepsDir)
+    param(
+        [Parameter(Mandatory=$true)][string]$DepsDir,
+        [Parameter(Mandatory=$true)][string]$Generator
+    )
 
     $spirvSrc  = Join-Path $DepsDir "SPIRV-Headers"
     $spirvBld  = Join-Path $spirvSrc "build"
     $spirvInst = Join-Path $spirvSrc "install"
-    $marker    = Join-Path $spirvInst "include\spirv\spirv.hpp"
+    # SPIRV-Headers installs include\spirv\unified1\spirv.hpp (not include\spirv\spirv.hpp).
+    $marker    = Join-Path $spirvInst "include\spirv\unified1\spirv.hpp"
+    $cmakeCfg  = Join-Path $spirvInst "share\cmake\SPIRV-Headers\SPIRV-HeadersConfig.cmake"
 
-    if (Test-Path $marker) {
+    if ((Test-Path $marker) -and (Test-Path $cmakeCfg)) {
         OK "SPIRV-Headers already installed: $spirvInst"
         return $spirvInst
     }
     if (-not (Is-Available "git")) {
-        WARN "git not available — cannot build SPIRV-Headers"
+        WARN "git not available - cannot build SPIRV-Headers"
         return $null
     }
 
@@ -369,14 +453,15 @@ function Build-SpirvHeaders {
     # IMPORTANT: route native command output to the host (Out-Host). Anything
     # written to the success stream inside this function would be captured by
     # "$spirvPrefix = Build-SpirvHeaders ..." and corrupt the returned path.
-    if (-not (Test-Path $spirvSrc)) {
+    if (-not (Test-Path (Join-Path $spirvSrc ".git"))) {
+        if (Test-Path $spirvSrc) { Remove-PathWithRetry $spirvSrc }
         git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git $spirvSrc | Out-Host
+        if ($LASTEXITCODE -ne 0) { WARN "SPIRV-Headers clone failed"; return $null }
     }
     New-Item -ItemType Directory -Path $spirvBld -Force | Out-Null
 
-    $gen = Get-VsGenerator
-    $cfgFlags = @("-S", $spirvSrc, "-B", $spirvBld, "-G", $gen, "-A", "x64",
-                  "-DCMAKE_INSTALL_PREFIX=$spirvInst")
+    $cfgFlags = @("-S", $spirvSrc, "-B", $spirvBld, "-G", $Generator, "-A", "x64",
+                  "-DCMAKE_INSTALL_PREFIX=$spirvInst", "-DSPIRV_HEADERS_ENABLE_TESTS=OFF")
     & $CMAKE_EXE @cfgFlags | Out-Host
     if ($LASTEXITCODE -ne 0) { WARN "SPIRV-Headers configure failed"; return $null }
     & $CMAKE_EXE --build $spirvBld --config Release | Out-Host
@@ -388,50 +473,23 @@ function Build-SpirvHeaders {
     return $spirvInst
 }
 
-function Build-WebUi {
-    # Build the llama.cpp web UI from source (npm ci + npm run build).
-    param([Parameter(Mandatory=$true)][string]$RepoDir)
-    $uiDir = Join-Path $RepoDir "tools\ui"
-    if (-not (Test-Path (Join-Path $uiDir "package.json"))) { return $false }
-    if (-not (Is-Available "npm")) {
-        WARN "npm not found — skipping web UI build (DLLAMA_BUILD_UI needs it)"
-        return $false
-    }
-    Log "Building web UI ($uiDir)"
-    Push-Location $uiDir
-    try {
-        npm ci
-        if ($LASTEXITCODE -ne 0) { WARN "npm ci failed"; return $false }
-        npm run build
-        if ($LASTEXITCODE -ne 0) { WARN "npm run build failed"; return $false }
-    } finally {
-        Pop-Location
-    }
-    OK "Web UI built"
-    return $true
-}
-
-function Resolve-HipClangBin {
-    # Resolve the AMD HIP SDK bin dir holding clang/clang++/hipcc (Windows).
+function Resolve-HipRoot {
+    # Resolve the AMD HIP SDK root (the folder holding bin\clang.exe).
     # CMake's HIP language is not supported on Windows, so ggml-hip forces the
-    # hipcc/clang compiler path — we must point CMAKE_C/CXX_COMPILER at it.
+    # hipcc/clang compiler path - we must point CMAKE_C/CXX_COMPILER at it.
     $candidates = @()
-    if ($env:HIP_PATH) {
-        $candidates += Join-Path $env:HIP_PATH "bin"
-        $candidates += $env:HIP_PATH
+    foreach ($v in @($env:HIP_PATH, $env:ROCM_PATH)) {
+        if ($v) { $candidates += $v.TrimEnd('\') }
     }
-    foreach ($base in @("C:\Program Files\AMD\ROCm",
-                        "C:\Program Files\AMD\ROCm\<version>",
-                        "C:\AMD\ROCm")) {
+    foreach ($base in @("C:\Program Files\AMD\ROCm", "C:\AMD\ROCm")) {
         if (Test-Path $base) {
-            $candidates += Join-Path $base "bin"
-            Get-ChildItem $base -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-                $candidates += Join-Path $_.FullName "bin"
-            }
+            Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
+                Sort-Object { try { [version]$_.Name } catch { [version]"0.0" } } -Descending |
+                ForEach-Object { $candidates += $_.FullName }
         }
     }
     foreach ($c in $candidates) {
-        if ((Test-Path $c) -and (Test-Path (Join-Path $c "clang.exe"))) {
+        if ((Test-Path $c) -and (Test-Path (Join-Path $c "bin\clang.exe"))) {
             return $c
         }
     }
@@ -440,16 +498,154 @@ function Resolve-HipClangBin {
 
 function Get-AmdGfxTarget {
     # Detect the installed AMD GPU gfx target(s) for HIP builds (e.g. gfx1201).
-    # AMDGPU_TARGETS is deprecated upstream; GPU_TARGETS is the supported name.
-    try {
-        $out = & hipconfig --droc-arch 2>$null
-        if ($LASTEXITCODE -eq 0 -and $out) { return ($out -join ',') }
-    } catch {}
-    try {
-        $out = & rocminfo 2>$null | Select-String -Pattern '^\s*Name:\s*gfx'
-        if ($out) { return (($out -replace '.*Name:\s*', '').Trim() -join ',') }
-    } catch {}
-    return $null
+    # hipInfo.exe ships with the Windows HIP SDK; rocminfo is Linux-only.
+    param([string]$HipRoot = "")
+    $targets = @()
+    $hipInfo = if ($HipRoot -and (Test-Path (Join-Path $HipRoot "bin\hipInfo.exe"))) { Join-Path $HipRoot "bin\hipInfo.exe" } elseif (Is-Available "hipInfo") { "hipInfo" } else { $null }
+    if ($hipInfo) {
+        $out = Invoke-Native { & $hipInfo }
+        foreach ($m in [regex]::Matches($out, 'gcnArchName:\s*(gfx[0-9a-f]+)')) {
+            $t = $m.Groups[1].Value
+            if ($targets -notcontains $t) { $targets += $t }
+        }
+    }
+    if ($targets.Count -eq 0) {
+        foreach ($tool in @("rocm_agent_enumerator", "rocminfo")) {
+            if (Is-Available $tool) {
+                $out = Invoke-Native { & $tool }
+                foreach ($m in [regex]::Matches($out, '\b(gfx[0-9a-f]{3,5})\b')) {
+                    $t = $m.Groups[1].Value
+                    if ($t -ne "gfx000" -and $targets -notcontains $t) { $targets += $t }
+                }
+            }
+        }
+    }
+    if ($targets.Count -eq 0) { return $null }
+    return ($targets -join ";")
+}
+
+function Get-HipCompatibilityResourceDir {
+    # HIP SDK <= 7.2 clang headers declare __device__ cmath overloads AFTER MSVC's
+    # <cmath> (14.5x) created implicit host+device constexpr overloads, so every
+    # HIP TU fails with "cannot overload __host__ __device__ function" (fixed
+    # upstream in LLVM PR #201563). Keep Program Files pristine: copy clang's
+    # resource tree into deps/ and apply the upstream include reorder there,
+    # then pass that private tree via -resource-dir. Returns "" when the
+    # installed headers are already fixed.
+    param(
+        [Parameter(Mandatory=$true)][string]$Clang,
+        [Parameter(Mandatory=$true)][string]$HipRoot,
+        [Parameter(Mandatory=$true)][string]$DepsDir
+    )
+    $resourceDir = Invoke-Native { & $Clang -print-resource-dir }
+    if (-not $resourceDir -or -not (Test-Path $resourceDir)) { return "" }
+    $wrapper = Join-Path $resourceDir "include\__clang_hip_runtime_wrapper.h"
+    if (-not (Test-Path $wrapper)) { return "" }
+    $forwardInclude = "#include <__clang_cuda_math_forward_declares.h>"
+    $cmathInclude = "#include <cmath>"
+    $sourceText = Get-Content $wrapper -Raw
+    $forwardIndex = $sourceText.IndexOf($forwardInclude, [StringComparison]::Ordinal)
+    $cmathIndex = $sourceText.IndexOf($cmathInclude, [StringComparison]::Ordinal)
+    if ($forwardIndex -lt 0 -or $cmathIndex -lt 0 -or $forwardIndex -lt $cmathIndex) {
+        return ""   # already in the fixed order (or a layout we do not understand)
+    }
+
+    $hipVersion = Split-Path $HipRoot -Leaf
+    $clangVersion = Split-Path $resourceDir -Leaf
+    $patchedDir = Join-Path $DepsDir "toolchains\hip-${hipVersion}-clang-${clangVersion}-llvm-pr201563"
+    $patchedWrapper = Join-Path $patchedDir "include\__clang_hip_runtime_wrapper.h"
+    $sha = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.IO.File]::ReadAllBytes($wrapper))).Replace("-", "")
+    $markerFile = Join-Path $patchedDir ".source-sha256"
+    $reuse = $false
+    if ((Test-Path $patchedWrapper) -and (Test-Path $markerFile)) {
+        $reuse = ((Get-Content $markerFile -Raw).Trim() -eq $sha)
+    }
+    if (-not $reuse) {
+        if (Test-Path $patchedDir) { Remove-PathWithRetry $patchedDir }
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $patchedDir) | Out-Null
+        Copy-Item -LiteralPath $resourceDir -Destination $patchedDir -Recurse -Force
+        $newline = if ($sourceText.Contains("`r`n")) { "`r`n" } else { "`n" }
+        $withoutLate = [regex]::Replace($sourceText, '(?m)^#include <__clang_cuda_math_forward_declares\.h>\r?\n', '')
+        $patched = ([regex]'(?m)^(#if !defined\(__HIPCC_RTC__\)\r?\n)').Replace($withoutLate, ('$1' + $forwardInclude + $newline), 1)
+        if ($patched -eq $withoutLate) {
+            WARN "Could not apply the HIP cmath header fix (unexpected wrapper layout); building with stock headers."
+            return ""
+        }
+        [System.IO.File]::WriteAllText($patchedWrapper, $patched, [System.Text.UTF8Encoding]::new($false))
+        Set-Content -LiteralPath $markerFile -Value $sha -NoNewline -Encoding ascii
+    }
+    OK "Applied HIP cmath header fix (LLVM PR #201563): $patchedDir"
+    return $patchedDir.Replace('\', '/')
+}
+
+function Copy-HipRuntimeDependencies {
+    # Bundle the ROCm runtime DLLs next to the executables and link the Tensile
+    # kernel libraries (rocblas/, hipblaslt/) so the folder works without ROCm
+    # in PATH. Junctions avoid duplicating ~1 GiB per build.
+    param(
+        [Parameter(Mandatory=$true)][string]$BinDir,
+        [Parameter(Mandatory=$true)][string]$HipRoot
+    )
+    $src = Join-Path $HipRoot "bin"
+    $copied = 0
+    foreach ($pattern in @("amdhip64_*.dll", "amd_comgr_*.dll", "hipblas.dll", "rocblas.dll", "hipblaslt.dll", "rocm_kpack.dll", "hiprtc*.dll")) {
+        Get-ChildItem -Path $src -Filter $pattern -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName -Destination $BinDir -Force
+            $copied++
+        }
+    }
+    foreach ($dirName in @("rocblas", "hipblaslt")) {
+        $srcDir = Join-Path $src $dirName
+        $dstDir = Join-Path $BinDir $dirName
+        if (-not (Test-Path $srcDir)) { continue }
+        if (Test-Path $dstDir) { continue }
+        try {
+            New-Item -ItemType Junction -Path $dstDir -Target $srcDir | Out-Null
+        } catch {
+            WARN "Could not link $dirName kernels ($($_.Exception.Message)); copying instead."
+            Copy-Item -LiteralPath $srcDir -Destination $dstDir -Recurse -Force
+        }
+    }
+    OK "Bundled $copied ROCm runtime DLL(s) from $src"
+}
+
+function Get-CudaToolkits {
+    # All installed CUDA toolkits, newest first (numeric sort, not string sort).
+    $base = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+    $list = @()
+    if (Test-Path $base) {
+        Get-ChildItem $base -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.Name -match '^v(\d+)\.(\d+)') {
+                $list += [PSCustomObject]@{ Path = $_.FullName; Version = [version]"$($Matches[1]).$($Matches[2])"; Major = [int]$Matches[1] }
+            }
+        }
+    }
+    if ($env:CUDA_PATH -and (Test-Path $env:CUDA_PATH) -and -not ($list | Where-Object { $_.Path -eq $env:CUDA_PATH })) {
+        $verText = Invoke-Native { & (Join-Path $env:CUDA_PATH "bin\nvcc.exe") --version }
+        if ($verText -match 'release\s+(\d+)\.(\d+)') {
+            $list += [PSCustomObject]@{ Path = $env:CUDA_PATH; Version = [version]"$($Matches[1]).$($Matches[2])"; Major = [int]$Matches[1] }
+        }
+    }
+    return @($list | Where-Object { Test-Path (Join-Path $_.Path "bin\nvcc.exe") } | Sort-Object Version -Descending)
+}
+
+function Get-NvidiaInfo {
+    # Driver-supported CUDA version and compute capabilities from nvidia-smi.
+    $info = [PSCustomObject]@{ DriverCuda = $null; ComputeCaps = @(); Names = @() }
+    if (-not (Is-Available "nvidia-smi")) { return $info }
+    $banner = Invoke-Native { & nvidia-smi }
+    if ($banner -match 'CUDA Version:\s*(\d+\.\d+)') { $info.DriverCuda = [version]$Matches[1] }
+    $csv = Invoke-Native { & nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader }
+    if ($script:LastNativeExit -eq 0 -and $csv) {
+        foreach ($line in ($csv -split "`n")) {
+            $parts = $line -split ","
+            if ($parts.Count -ge 2 -and $parts[1].Trim() -match '^\d+\.\d+$') {
+                $info.Names += $parts[0].Trim()
+                $info.ComputeCaps += $parts[1].Trim()
+            }
+        }
+    }
+    return $info
 }
 
 # --- 0. INSTALL DIRECTORY ---
@@ -459,27 +655,19 @@ if (-not (Test-Path $InstallDir)) {
 }
 OK $InstallDir
 
-# --- 1. CHOCOLATEY / WINGET ---
+# --- 1. PACKAGE MANAGER (used only for missing prerequisites) ---
 Log "Checking package manager"
 $hasChoco = Is-Available "choco"
 $hasWingetPkg = Is-Available "winget"
-
-if ($isAdmin -and -not $hasChoco) {
-    Log "Installing Chocolatey..."
-    Set-ExecutionPolicy Bypass -Scope Process -Force
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-    Refresh-Path
-    Add-ToPath "$env:ALLUSERSPROFILE\chocolatey\bin"
-    $hasChoco = Is-Available "choco"
+if ($hasWingetPkg) {
+    $useWinget = $true
+    OK "winget available (used for missing prerequisites)"
 } elseif ($hasChoco) {
     OK "Chocolatey: $(choco --version)"
-} elseif ($hasWingetPkg) {
-    $useWinget = $true
-    OK "Using winget (no admin rights needed)"
 } else {
-    WARN "No package manager found (choco/winget). Dependency installs may fail."
+    WARN "No package manager found (winget/choco). Missing prerequisites must be installed manually."
 }
+if (-not $isAdmin) { Write-Host "    INFO: not running as Administrator (not required)." -ForegroundColor DarkGray }
 
 # --- 2. GIT ---
 Log "Checking Git"
@@ -491,9 +679,9 @@ if (-not (Is-Available "git")) {
     }
     Refresh-Path
     Add-ToPath "C:\Program Files\Git\cmd"
-} else {
-    OK "Git: $(git --version)"
 }
+if (-not (Is-Available "git")) { WARN "git is required: https://git-scm.com/download/win"; exit 1 }
+OK "Git: $(git --version)"
 
 # --- 3. CMAKE ---
 Log "Checking CMake"
@@ -508,26 +696,16 @@ if (-not (Is-Available "cmake")) {
     Add-ToPath "C:\Program Files\CMake\bin"
 }
 $CMAKE_EXE = Get-SystemCmake
-OK "CMake: $CMAKE_EXE ($(& $CMAKE_EXE --version | Select-Object -First 1))"
+if (-not $CMAKE_EXE) { WARN "cmake is required: https://cmake.org/download/"; exit 1 }
+$cmakeVersionText = (& $CMAKE_EXE --version | Select-Object -First 1)
+OK "CMake: $CMAKE_EXE ($cmakeVersionText)"
+$cmakeVersion = if ($cmakeVersionText -match '(\d+)\.(\d+)') { [version]"$($Matches[1]).$($Matches[2])" } else { [version]"0.0" }
 
 # --- 4. VISUAL STUDIO BUILD TOOLS ---
 Log "Checking Visual Studio Build Tools"
-$vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vsFound = $false
-
-if (Test-Path $vsWhere) {
-    $vsJson = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json 2>$null
-    if ($vsJson) {
-        $vsInstalls = $vsJson | ConvertFrom-Json
-        if ($vsInstalls) {
-            $vsFound = $true
-            OK "Visual Studio found: $($vsInstalls.displayName)"
-        }
-    }
-}
-
-if (-not $vsFound) {
-    Log "Installing Visual Studio Build Tools 2022..."
+$vs = Get-VsInstance
+if (-not $vs) {
+    Log "Installing Visual Studio Build Tools 2022 (C++ workload)..."
     if ($useWinget) {
         winget install --id Microsoft.VisualStudio.2022.BuildTools -e --source winget `
             --accept-source-agreements --accept-package-agreements `
@@ -544,150 +722,149 @@ if (-not $vsFound) {
         ) -Wait -NoNewWindow
     }
     Refresh-Path
-    OK "Build Tools installed"
+    $vs = Get-VsInstance
+    if (-not $vs) { WARN "Visual Studio C++ tools still not found."; exit 1 }
 }
+OK "Visual Studio found: $($vs.DisplayName) (v$($vs.Version) -> $($vs.Generator))"
+if ($vs.Major -ge 18 -and $cmakeVersion -lt [version]"4.1") {
+    WARN "Visual Studio 2026 needs CMake 4.1 or newer (found $cmakeVersion). Update: winget upgrade Kitware.CMake"
+    exit 1
+}
+$msvcClExe = Resolve-MsvcClPath -VsInstallPath $vs.Path
+if (-not $msvcClExe) {
+    WARN "Could not locate MSVC cl.exe under: $($vs.Path)"
+    WARN "Install the C++ workload / MSVC x64 tools in Visual Studio Installer."
+    exit 1
+}
+OK "MSVC cl.exe: $msvcClExe"
 
 # --- 5. CUDA (only if BuildType = CUDA) ---
+$cudaInstallDir = $null
+$cudaToolkit = $null
+$nvidiaInfo = $null
 if ($BuildType -eq "CUDA") {
     Log "Checking CUDA Toolkit"
-    $CUDA_BASE = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
-    $cudaFound = $false
-    $nvccPaths = @(
-        "$CUDA_BASE\v12.9\bin",
-        "$CUDA_BASE\v12.8\bin",
-        "$CUDA_BASE\v12.6\bin",
-        "$CUDA_BASE\v12.4\bin",
-        "$CUDA_BASE\v12.2\bin",
-        "$CUDA_BASE\v12.0\bin",
-        "$CUDA_BASE\v11.8\bin"
-    )
-    foreach ($p in $nvccPaths) { Add-ToPath $p }
-
-    if (Is-Available "nvcc") {
-        $cudaVer = nvcc --version 2>&1 | Select-String "release"
-        OK "CUDA found: $cudaVer"
-        $cudaFound = $true
-    }
-
-    if (-not $cudaFound) {
-        WARN "CUDA not found! Please install CUDA Toolkit."
+    $toolkits = Get-CudaToolkits
+    if ($toolkits.Count -eq 0) {
+        WARN "CUDA Toolkit not found! Please install it (with Visual Studio integration)."
         WARN "Download: https://developer.nvidia.com/cuda-downloads"
         exit 1
     }
+    OK "Installed toolkits: $(($toolkits | ForEach-Object { $_.Version.ToString() }) -join ', ')"
+
+    $nvidiaInfo = Get-NvidiaInfo
+    if ($nvidiaInfo.DriverCuda) { OK "Driver supports CUDA up to $($nvidiaInfo.DriverCuda)" }
+    if ($nvidiaInfo.ComputeCaps.Count -gt 0) { OK "GPU compute capability: $($nvidiaInfo.ComputeCaps -join ', ') ($($nvidiaInfo.Names -join ', '))" }
+
+    if ($CudaMajor) {
+        $cudaToolkit = $toolkits | Where-Object { $_.Major -eq [int]$CudaMajor } | Select-Object -First 1
+        if (-not $cudaToolkit) {
+            WARN "No CUDA $CudaMajor.x toolkit installed (found: $(($toolkits | ForEach-Object { $_.Version.ToString() }) -join ', '))."
+            WARN "Install CUDA $CudaMajor.x or choose the other CUDA profile."
+            exit 1
+        }
+    } else {
+        $cudaToolkit = $toolkits[0]
+    }
+    $cudaInstallDir = $cudaToolkit.Path
+
+    if ($nvidiaInfo.DriverCuda -and $cudaToolkit.Version -gt $nvidiaInfo.DriverCuda) {
+        WARN "CUDA toolkit $($cudaToolkit.Version) is newer than what the NVIDIA driver supports ($($nvidiaInfo.DriverCuda))."
+        WARN "The binaries will fail at runtime ('CUDA driver version is insufficient')."
+        WARN "Update the driver or pick the CUDA 12.x profile."
+        exit 1
+    }
+    if ($cudaToolkit.Major -ge 13 -and ($nvidiaInfo.ComputeCaps | Where-Object { [version]$_ -lt [version]"7.5" })) {
+        WARN "CUDA 13 dropped support for GPUs older than Turing (compute capability < 7.5)."
+        WARN "Use the CUDA 12.x profile for this GPU."
+        exit 1
+    }
+
+    # Make nvcc/cudart of exactly this toolkit the first hit in PATH.
+    $env:PATH = "$cudaInstallDir\bin;$env:PATH"
+    $env:CUDA_PATH = $cudaInstallDir
+    $env:CUDAToolkit_ROOT = $cudaInstallDir
+    $cudaVerText = Invoke-Native { & (Join-Path $cudaInstallDir "bin\nvcc.exe") --version }
+    $cudaVer = if ($cudaVerText -match 'release[^\r\n]*') { $Matches[0] } else { "" }
+    OK "Using CUDA $($cudaToolkit.Version): $cudaInstallDir ($cudaVer)"
 
     # CUDA VS Integration
     Log "Setting up CUDA Visual Studio integration"
-    $cudaInstallDir = $null
-    if ($env:CUDA_PATH -and (Test-Path $env:CUDA_PATH)) {
-        $cudaInstallDir = $env:CUDA_PATH
-    } else {
-        if (Test-Path $CUDA_BASE) {
-            $latest = Get-ChildItem $CUDA_BASE | Sort-Object Name -Descending | Select-Object -First 1
-            if ($latest) {
-                $cudaInstallDir = $latest.FullName
-                $env:CUDA_PATH = $cudaInstallDir
-            }
-        }
-    }
-
     $cudaVsIntSrc = "$cudaInstallDir\extras\visual_studio_integration\MSBuildExtensions"
     $cudaPropsInstalled = $false
-    
+
     if (Test-Path $cudaVsIntSrc) {
-        # Find VS installation path using vswhere
-        $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-        $vsInstallPath = $null
-        
-        if (Test-Path $vsWhere) {
-            $vsInstallPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
-        }
-        
-        # Build target directories list
         $vsTargetDirs = @()
-        
-        # Add detected VS path first
-        if ($vsInstallPath) {
-            $vsVersion = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion 2>$null
-            $vsMajor = [int]($vsVersion.Split(".")[0])
-            if ($vsMajor -ge 17) {
-                $vsTargetDirs += Join-Path $vsInstallPath "MSBuild\Microsoft\VC\v170\BuildCustomizations"
-            } elseif ($vsMajor -eq 16) {
-                $vsTargetDirs += Join-Path $vsInstallPath "MSBuild\Microsoft\VC\v160\BuildCustomizations"
-            } elseif ($vsMajor -eq 15) {
-                $vsTargetDirs += Join-Path $vsInstallPath "MSBuild\Microsoft\VC\v150\BuildCustomizations"
-            } elseif ($vsMajor -eq 14) {
-                $vsTargetDirs += Join-Path $vsInstallPath "MSBuild\Microsoft\VC\v140\BuildCustomizations"
-            }
+        if ($vs.Major -ge 17) {
+            $vsTargetDirs += Join-Path $vs.Path "MSBuild\Microsoft\VC\v170\BuildCustomizations"
+        } elseif ($vs.Major -eq 16) {
+            $vsTargetDirs += Join-Path $vs.Path "MSBuild\Microsoft\VC\v160\BuildCustomizations"
+        } elseif ($vs.Major -eq 15) {
+            $vsTargetDirs += Join-Path $vs.Path "MSBuild\Microsoft\VC\v150\BuildCustomizations"
+        } elseif ($vs.Major -eq 14) {
+            $vsTargetDirs += Join-Path $vs.Path "MSBuild\Microsoft\VC\v140\BuildCustomizations"
         }
-        
-        # Add common paths as fallback (all versions)
-        $vsTargetDirs += @(
-            "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VC\v170\BuildCustomizations",
-            "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VC\v170\BuildCustomizations",
-            "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\MSBuild\Microsoft\VC\v160\BuildCustomizations",
-            "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\MSBuild\Microsoft\VC\v160\BuildCustomizations",
-            "C:\Program Files (x86)\Microsoft Visual Studio\2017\BuildTools\MSBuild\Microsoft\VC\v150\BuildCustomizations",
-            "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\MSBuild\Microsoft\VC\v150\BuildCustomizations",
-            "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VC\v170\BuildCustomizations",
-            "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VC\v170\BuildCustomizations"
-        )
-        
+
         foreach ($target in $vsTargetDirs) {
-            $vsBase = Split-Path (Split-Path (Split-Path (Split-Path $target)))
-            if (Test-Path $vsBase) {
-                try {
-                    New-Item -ItemType Directory -Path $target -Force | Out-Null
-                    Copy-Item "$cudaVsIntSrc\*" $target -Force -ErrorAction Stop
-                    OK "CUDA Props -> $target"
-                    $cudaPropsInstalled = $true
-                    break
-                } catch {
-                    # Try with elevated privileges
-                    Log "Requesting admin rights to copy CUDA props..."
-                    $copyScript = @"
+            $alreadyThere = (Test-Path $target) -and (Get-ChildItem $cudaVsIntSrc -File | ForEach-Object { Test-Path (Join-Path $target $_.Name) }) -notcontains $false
+            if ($alreadyThere) { OK "CUDA Props already present in $target"; $cudaPropsInstalled = $true; break }
+            try {
+                New-Item -ItemType Directory -Path $target -Force | Out-Null
+                Copy-Item "$cudaVsIntSrc\*" $target -Force -ErrorAction Stop
+                OK "CUDA Props -> $target"
+                $cudaPropsInstalled = $true
+                break
+            } catch {
+                # Try with elevated privileges
+                Log "Requesting admin rights to copy CUDA props..."
+                $copyScript = @"
 New-Item -ItemType Directory -Path '$target' -Force | Out-Null
 Copy-Item '$cudaVsIntSrc\*' '$target' -Force
 "@
-                    $tempScript = [System.IO.Path]::GetTempFileName() + ".ps1"
-                    $copyScript | Out-File -FilePath $tempScript -Encoding UTF8
-                    
-                    try {
-                        $process = Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -File `"$tempScript`"" -Verb RunAs -Wait -PassThru
-                        if ($process.ExitCode -eq 0) {
-                            OK "CUDA Props -> $target (with admin rights)"
-                            $cudaPropsInstalled = $true
-                            break
-                        }
-                    } catch {
-                        WARN "Could not copy to $target (admin rights denied)"
-                    } finally {
-                        Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
+                $tempScript = [System.IO.Path]::GetTempFileName() + ".ps1"
+                $copyScript | Out-File -FilePath $tempScript -Encoding UTF8
+
+                try {
+                    $process = Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -File `"$tempScript`"" -Verb RunAs -Wait -PassThru
+                    if ($process.ExitCode -eq 0) {
+                        OK "CUDA Props -> $target (with admin rights)"
+                        $cudaPropsInstalled = $true
+                        break
                     }
+                } catch {
+                    WARN "Could not copy to $target (admin rights denied)"
+                } finally {
+                    Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
                 }
             }
         }
     } else {
         WARN "CUDA MSBuildExtensions not found at $cudaVsIntSrc"
     }
+    if (-not $cudaPropsInstalled) {
+        WARN "CUDA Visual Studio integration is not installed; CMake will not find the CUDA toolset."
+    }
 }
 
 # --- 6. VULKAN (only if BuildType = Vulkan) ---
+$spirvPrefix = $null
 if ($BuildType -eq "Vulkan") {
     Log "Checking Vulkan SDK"
     $vulkanFound = $false
 
-    if (Is-Available "glslangValidator") {
-        OK "Vulkan SDK found (glslangValidator in PATH)"
+    # llama.cpp needs glslc (Vulkan::glslc); glslangValidator ships alongside it.
+    if ((Is-Available "glslc") -or (Is-Available "glslangValidator")) {
+        OK "Vulkan SDK found (glslc in PATH)"
         $vulkanFound = $true
-    } elseif ($env:VULKAN_SDK -and (Test-Path "$env:VULKAN_SDK\Bin\glslangValidator.exe")) {
+    } elseif ($env:VULKAN_SDK -and (Test-Path "$env:VULKAN_SDK\Bin\glslc.exe")) {
         Add-ToPath "$env:VULKAN_SDK\Bin"
         OK "Vulkan SDK found via VULKAN_SDK env ($env:VULKAN_SDK)"
         $vulkanFound = $true
     } else {
         foreach ($sdkBase in @("C:\VulkanSDK", "C:\Program Files\VulkanSDK")) {
             if (Test-Path $sdkBase) {
-                $latestVer = Get-ChildItem $sdkBase -Directory | Sort-Object Name -Descending | Select-Object -First 1
-                if ($latestVer -and (Test-Path "$($latestVer.FullName)\Bin\glslangValidator.exe")) {
+                $latestVer = Get-ChildItem $sdkBase -Directory | Sort-Object { try { [version]$_.Name } catch { [version]"0.0" } } -Descending | Select-Object -First 1
+                if ($latestVer -and (Test-Path "$($latestVer.FullName)\Bin\glslc.exe")) {
                     $env:VULKAN_SDK = $latestVer.FullName
                     Add-ToPath "$($latestVer.FullName)\Bin"
                     OK "Vulkan SDK found at $($latestVer.FullName)"
@@ -707,7 +884,7 @@ if ($BuildType -eq "Vulkan") {
     # RDNA4 (Radeon RX 9000) needs SPIRV-Headers newer than the Vulkan SDK
     # ships. Build them from source once (cached under deps/) and feed the
     # install prefix to CMake via CMAKE_PREFIX_PATH.
-    $spirvPrefix = Build-SpirvHeaders -DepsDir $DepsDir
+    $spirvPrefix = Build-SpirvHeaders -DepsDir $DepsDir -Generator $vs.Generator
 }
 
 # --- 6b. SYCL / Intel oneAPI (only if BuildType = SYCL) ---
@@ -739,20 +916,16 @@ if ($BuildType -eq "SYCL") {
     } else {
         foreach ($oneapiBase in $oneapiPaths) {
             if (Test-Path $oneapiBase) {
-                $compilerDir = Join-Path $oneapiBase "compiler\latest\bin"
-                if (Test-Path (Join-Path $compilerDir "icx.exe")) {
-                    Add-ToPath $compilerDir
-                    OK "Intel oneAPI found at $compilerDir"
-                    $syclFound = $true
-                    break
+                foreach ($rel in @("compiler\latest\bin", "compiler\latest\windows\bin")) {
+                    $compilerDir = Join-Path $oneapiBase $rel
+                    if (Test-Path (Join-Path $compilerDir "icx.exe")) {
+                        Add-ToPath $compilerDir
+                        OK "Intel oneAPI found at $compilerDir"
+                        $syclFound = $true
+                        break
+                    }
                 }
-                $compilerDir2 = Join-Path $oneapiBase "compiler\latest\windows\bin"
-                if (Test-Path (Join-Path $compilerDir2 "icx.exe")) {
-                    Add-ToPath $compilerDir2
-                    OK "Intel oneAPI found at $compilerDir2"
-                    $syclFound = $true
-                    break
-                }
+                if ($syclFound) { break }
             }
         }
     }
@@ -779,8 +952,8 @@ if ($BuildType -eq "SYCL") {
         exit 1
     }
 
-    # Verify Ninja is available (required for SYCL builds)
-    if (-not (Is-Available "ninja")) {
+    $ninjaExe = Resolve-NinjaPath -VsInstallPath $vs.Path
+    if (-not $ninjaExe) {
         Log "Installing Ninja (required for SYCL build)..."
         if ($useWinget) {
             winget install --id Ninja-build.Ninja -e --source winget --accept-source-agreements --accept-package-agreements
@@ -788,43 +961,44 @@ if ($BuildType -eq "SYCL") {
             choco install ninja -y --no-progress
         }
         Refresh-Path
+        $ninjaExe = Resolve-NinjaPath -VsInstallPath $vs.Path
     }
-    if (Is-Available "ninja") {
-        OK "Ninja: $(ninja --version)"
-    } else {
-        WARN "Ninja not found! Required for SYCL builds."
-        WARN "Install via: winget install Ninja-build.Ninja"
+    if (-not $ninjaExe) {
+        WARN "Ninja not found! Required for SYCL builds. Install: winget install Ninja-build.Ninja"
         exit 1
     }
+    OK "Ninja: $ninjaExe"
 }
 
 # --- 6c. HIP / ROCm (only if BuildType = HIP) ---
+$hipRoot = $null
 $hipClangBin = $null
 $amdGfxTarget = $null
+$hipResourceDir = ""
 if ($BuildType -eq "HIP") {
     Log "Checking AMD HIP SDK"
 
     # CMake does not support the HIP language on Windows, so ggml-hip builds
     # via the hipcc/clang compiler. This is fundamentally different from the
-    # VS-generator + MSVC path used by CPU/CUDA/Vulkan — it needs Ninja.
-    $hipClangBin = Resolve-HipClangBin
-    if ($hipClangBin) {
-        Add-ToPath $hipClangBin
-        OK "HIP SDK clang found: $hipClangBin"
-    } else {
+    # VS-generator + MSVC path used by CPU/CUDA/Vulkan - it needs Ninja.
+    $hipRoot = Resolve-HipRoot
+    if (-not $hipRoot) {
         WARN "AMD HIP SDK (clang/hipcc) not found!"
         WARN "Install the AMD HIP SDK and set HIP_PATH, or use Vulkan instead."
-        WARN "RDNA4 (Radeon RX 9000) users should choose Vulkan — HIP on Windows"
-        WARN "for gfx1201 is known to be unreliable."
+        WARN "RDNA4 (Radeon RX 9000 / AI PRO R9000) users should choose Vulkan - HIP on"
+        WARN "Windows for gfx120x is known to be unreliable."
         exit 1
     }
-    if (-not (Is-Available "hipcc") -and -not (Is-Available "clang")) {
-        WARN "Neither hipcc nor clang is available from the HIP SDK."
-        exit 1
-    }
+    $hipClangBin = Join-Path $hipRoot "bin"
+    $env:HIP_PATH = "$hipRoot\"
+    $env:ROCM_PATH = $hipRoot
+    Add-ToPath $hipClangBin
+    OK "HIP SDK: $hipRoot"
 
-    # Ninja is required for the HIP build (no VS generator).
-    if (-not (Is-Available "ninja")) {
+    # Ninja + ROCm clang link against the MSVC ABI: import the exact VS environment.
+    Import-VsDevEnvironment -VsInstallPath $vs.Path | Out-Null
+    $ninjaExe = Resolve-NinjaPath -VsInstallPath $vs.Path
+    if (-not $ninjaExe) {
         Log "Installing Ninja (required for HIP build)..."
         if ($useWinget) {
             winget install --id Ninja-build.Ninja -e --source winget --accept-source-agreements --accept-package-agreements
@@ -832,53 +1006,46 @@ if ($BuildType -eq "HIP") {
             choco install ninja -y --no-progress
         }
         Refresh-Path
+        $ninjaExe = Resolve-NinjaPath -VsInstallPath $vs.Path
     }
-    if (-not (Is-Available "ninja")) {
+    if (-not $ninjaExe) {
         WARN "Ninja not found! Required for HIP builds. Install: winget install Ninja-build.Ninja"
         exit 1
     }
-    OK "Ninja: $(ninja --version)"
+    OK "Ninja: $ninjaExe"
 
     # Detect the AMD gfx target so we compile for the right GPU.
-    $amdGfxTarget = Get-AmdGfxTarget
+    $amdGfxTarget = Get-AmdGfxTarget -HipRoot $hipRoot
     if ($amdGfxTarget) {
-        OK "AMD GPU target: $amdGfxTarget"
+        OK "AMD GPU target(s): $amdGfxTarget"
         if ($amdGfxTarget -match "gfx120[01]") {
             WARN "Detected RDNA4 (gfx120x). HIP on Windows is unreliable for this"
-            WARN "hardware — Vulkan is strongly recommended. Continuing HIP anyway."
+            WARN "hardware - Vulkan is strongly recommended. Continuing HIP anyway."
         }
-    } else {
-        WARN "Could not auto-detect the AMD gfx target. Set -DGPU_TARGETS manually"
-        WARN "via Extra Flags if the build fails (e.g. -DGPU_TARGETS=gfx1201)."
+    } elseif (-not (Test-ExtraFlag "-DGPU_TARGETS=")) {
+        WARN "Could not auto-detect the AMD gfx target (hipInfo.exe missing?)."
+        WARN "Set -DGPU_TARGETS=gfxNNNN via Extra Flags; otherwise the HIP SDK default list is compiled (slow)."
     }
+
+    $hipResourceDir = Get-HipCompatibilityResourceDir -Clang (Join-Path $hipClangBin "clang.exe") -HipRoot $hipRoot -DepsDir $DepsDir
 }
 
 # --- 7. FINAL CHECK ---
 Log "Final check"
-$allOk = $true
-foreach ($cmd in @("git")) {
-    if (Is-Available $cmd) {
-        OK "$cmd OK"
-    } else {
-        WARN "$cmd MISSING"
-        $allOk = $false
-    }
-}
-if (-not $allOk) { exit 1 }
+OK "git OK"
 OK "cmake OK: $CMAKE_EXE"
 
 # --- 8. CLONE REPO ---
 Log "Checking $Source"
 Set-Location $InstallDir
 
-# Enable long paths for Windows (260 char limit workaround)
-git config --global core.longpaths true
-OK "git core.longpaths enabled"
+# Long paths (260 char limit) are enabled per repository, not in the global config.
+$gitLongPaths = @("-c", "core.longpaths=true")
 
-$versionPrefixPattern = if ($REPO_PR) { "pr$REPO_PR" } else { "(?:b\d+|bUNKNOWN)" }
 # Backend-qualified, Auto-Tuner-compatible folder name, e.g.
-# "b10819_vulkan_llama.cpp-main". One folder per source+version+backend.
+# "b10830_vulkan_llama.cpp". One folder per source+version+backend.
 $backend = $BuildType.ToLower()
+$versionPrefixPattern = "(?:b\d+|bUNKNOWN|pr\d+|pinned_[0-9a-f]+)"
 $existingDir = Get-ChildItem $InstallDir -Directory | Where-Object { $_.Name -match "^${versionPrefixPattern}_${backend}_$([regex]::Escape($DIR_SUFFIX))$" } | Sort-Object Name -Descending | Select-Object -First 1
 if ($existingDir -and -not (Test-Path (Join-Path $existingDir.FullName ".git"))) {
     # A previous run trimmed the checkout to its build output; it is no
@@ -887,37 +1054,54 @@ if ($existingDir -and -not (Test-Path (Join-Path $existingDir.FullName ".git")))
     $existingDir = $null
 }
 
+function Get-BuildNumberName {
+    # "bNNNN" from "git rev-list --count HEAD": llama.cpp's own build number
+    # (cmake/build-info.cmake), so the folder name matches llama-server --version.
+    param([Parameter(Mandatory=$true)][string]$Repo)
+    $count = Invoke-Native { & git -C $Repo rev-list --count HEAD }
+    if ($script:LastNativeExit -eq 0 -and $count -match '^\d+$') { return "b$count" }
+    return "bUNKNOWN"
+}
+
 if ($existingDir) {
     $dir = $existingDir.FullName
     if ($Update) {
         Log "Updating existing checkout: $dir"
         Push-Location $dir
         if ($SourceCommit) {
-            git fetch --all --prune
+            git @gitLongPaths fetch --all --prune
             if ($LASTEXITCODE -ne 0) { WARN "git fetch failed"; Pop-Location; exit 1 }
             if ($FetchRef) {
-                git fetch --force origin $FetchRef
+                git @gitLongPaths fetch --force origin $FetchRef
                 if ($LASTEXITCODE -ne 0) { WARN "git fetch ref '$FetchRef' failed"; Pop-Location; exit 1 }
             }
-            git checkout --detach $SourceCommit
+            git @gitLongPaths checkout --detach $SourceCommit
             if ($LASTEXITCODE -ne 0) { WARN "git checkout commit '$SourceCommit' failed"; Pop-Location; exit 1 }
         } elseif ($REPO_PR) {
-            git fetch --force origin "pull/$REPO_PR/head:pr$REPO_PR"
+            git @gitLongPaths fetch --force origin "pull/$REPO_PR/head:pr$REPO_PR"
             if ($LASTEXITCODE -ne 0) { WARN "git fetch PR #$REPO_PR failed"; Pop-Location; exit 1 }
-            git checkout "pr$REPO_PR"
+            git @gitLongPaths checkout "pr$REPO_PR"
             if ($LASTEXITCODE -ne 0) { WARN "git checkout PR #$REPO_PR failed"; Pop-Location; exit 1 }
-            git reset --hard "pr$REPO_PR"
+            git @gitLongPaths reset --hard "pr$REPO_PR"
             if ($LASTEXITCODE -ne 0) { WARN "git reset PR #$REPO_PR failed"; Pop-Location; exit 1 }
         } else {
-            git fetch --all --prune
+            git @gitLongPaths fetch --all --prune
             if ($LASTEXITCODE -ne 0) { WARN "git fetch failed"; Pop-Location; exit 1 }
-            git reset --hard "origin/$REPO_BRANCH"
+            git @gitLongPaths reset --hard "origin/$REPO_BRANCH"
             if ($LASTEXITCODE -ne 0) { WARN "git reset failed"; Pop-Location; exit 1 }
         }
-        git clean -fdx -e node_modules
+        git @gitLongPaths clean -fdx -e node_modules -e build
         if ($LASTEXITCODE -ne 0) { WARN "git clean failed"; Pop-Location; exit 1 }
         Pop-Location
         OK "Updated to latest '$REPO_BRANCH'"
+        # The build number may have moved: rename the folder to stay truthful.
+        $newName = "$(Get-BuildNumberName -Repo $dir)_${backend}_$DIR_SUFFIX"
+        $newDir = Join-Path $InstallDir $newName
+        if ($newDir -ne $dir) {
+            if (Test-Path -LiteralPath $newDir) { Remove-PathWithRetry $newDir }
+            Move-PathWithRetry $dir $newDir
+            $dir = $newDir
+        }
     } else {
         OK "Found existing directory: $dir (skipping update)"
     }
@@ -927,60 +1111,49 @@ if ($existingDir) {
 
     if ($SourceCommit) {
         Log "Cloning pinned source from $REPO_URL"
-        git clone $REPO_URL $tmpDir
+        git @gitLongPaths clone $REPO_URL $tmpDir
         if ($LASTEXITCODE -ne 0) { WARN "git clone failed"; exit 1 }
         if ($FetchRef) {
-            git -C $tmpDir fetch --force origin $FetchRef
+            git @gitLongPaths -C $tmpDir fetch --force origin $FetchRef
             if ($LASTEXITCODE -ne 0) { WARN "git fetch ref '$FetchRef' failed"; exit 1 }
         }
-        git -C $tmpDir checkout --detach $SourceCommit
+        git @gitLongPaths -C $tmpDir checkout --detach $SourceCommit
         if ($LASTEXITCODE -ne 0) { WARN "git checkout commit '$SourceCommit' failed"; exit 1 }
-        Push-Location $tmpDir
         if ($REPO_SUBMODULES) {
-            git submodule update --init --recursive
-            if ($LASTEXITCODE -ne 0) { WARN "git submodule update failed"; Pop-Location; exit 1 }
+            git @gitLongPaths -C $tmpDir submodule update --init --recursive
+            if ($LASTEXITCODE -ne 0) { WARN "git submodule update failed"; exit 1 }
         }
-        $desc = git describe --tags --always 2>$null
-        $ver  = [regex]::Match($desc, 'b\d+').Value
-        if (-not $ver) { $ver = "pinned_$($SourceCommit.Substring(0, [Math]::Min(9, $SourceCommit.Length)))" }
-        Pop-Location
     } elseif ($REPO_PR) {
         # PR-based source: clone the base repo, then fetch the pull request
         # ref into a local branch and check it out.
         Log "Fetching PR #$REPO_PR from $REPO_URL"
-        git clone $REPO_URL $tmpDir
+        git @gitLongPaths clone $REPO_URL $tmpDir
         if ($LASTEXITCODE -ne 0) { WARN "git clone failed"; exit 1 }
-        Push-Location $tmpDir
-        git fetch origin "pull/$REPO_PR/head:pr$REPO_PR"
-        if ($LASTEXITCODE -ne 0) { WARN "git fetch PR #$REPO_PR failed"; Pop-Location; exit 1 }
-        git checkout "pr$REPO_PR"
-        if ($LASTEXITCODE -ne 0) { WARN "git checkout PR #$REPO_PR failed"; Pop-Location; exit 1 }
+        git @gitLongPaths -C $tmpDir fetch origin "pull/$REPO_PR/head:pr$REPO_PR"
+        if ($LASTEXITCODE -ne 0) { WARN "git fetch PR #$REPO_PR failed"; exit 1 }
+        git @gitLongPaths -C $tmpDir checkout "pr$REPO_PR"
+        if ($LASTEXITCODE -ne 0) { WARN "git checkout PR #$REPO_PR failed"; exit 1 }
         if ($REPO_SUBMODULES) {
-            git submodule update --init --recursive
-            if ($LASTEXITCODE -ne 0) { WARN "git submodule update failed"; Pop-Location; exit 1 }
+            git @gitLongPaths -C $tmpDir submodule update --init --recursive
+            if ($LASTEXITCODE -ne 0) { WARN "git submodule update failed"; exit 1 }
         }
-        $desc = git describe --tags --always 2>$null
-        $ver  = [regex]::Match($desc, 'b\d+').Value
-        if (-not $ver) { $ver = "pr$REPO_PR" }
-        Pop-Location
     } else {
         $cloneArgs = @("clone", "--branch", $REPO_BRANCH)
         if ($REPO_SUBMODULES) { $cloneArgs += @("--recurse-submodules", "--shallow-submodules") }
         $cloneArgs += @($REPO_URL, $tmpDir)
-        git @cloneArgs
+        git @gitLongPaths @cloneArgs
         if ($LASTEXITCODE -ne 0) { WARN "git clone failed"; exit 1 }
-        Push-Location $tmpDir
-        $desc = git describe --tags --always 2>$null
-        $ver  = [regex]::Match($desc, 'b\d+').Value
-        if (-not $ver) { $ver = "bUNKNOWN" }
-        Pop-Location
     }
+    git -C $tmpDir config core.longpaths true | Out-Null
+    $ver = Get-BuildNumberName -Repo $tmpDir
     $dir = Join-Path $InstallDir "${ver}_${backend}_$DIR_SUFFIX"
     Set-Location $InstallDir
     if (Test-Path -LiteralPath $dir) { Remove-PathWithRetry $dir }
     Move-PathWithRetry $tmpDir $dir
     OK "Directory: $dir"
 }
+$headCommit = Invoke-Native { & git -C $dir rev-parse --short=9 HEAD }
+OK "Source commit: $headCommit"
 
 # --- 9. CMAKE CONFIGURE ---
 Log "CMake configuration ($BuildType)"
@@ -996,17 +1169,47 @@ if ($CleanBuild -and (Test-Path $buildDir)) {
     Log "Deleting old build directory (clean build)..."
     Remove-PathWithRetry $buildDir
 }
-
-# Create build directory (if it was removed or never existed)
 New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 
-# If CUDA build and props were copied locally, copy them to build directory
-if ($BuildType -eq "CUDA" -and $cudaInstallDir) {
-    $cudaVsIntSrc = "$cudaInstallDir\extras\visual_studio_integration\MSBuildExtensions"
-    if (Test-Path $cudaVsIntSrc) {
-        Copy-Item "$cudaVsIntSrc\*" $buildDir -Force
-        OK "CUDA props copied to build directory"
-    }
+# CPU instruction-set target. "portable" = x86-64-v3 (AVX2/FMA/F16C, plus
+# AVX-VNNI/BMI2 which llama.cpp only uses when the CPU has them at runtime),
+# runs on every CPU since Haswell/Zen1. "native" = llama.cpp's own CPUID
+# detection (AVX512/AMX) - only for the machine that builds it.
+$cpuFlags = @()
+if ($CpuTarget -eq "native") {
+    $cpuFlags = @("-DGGML_NATIVE=ON")
+} else {
+    $cpuFlags = @("-DGGML_NATIVE=OFF", "-DGGML_AVX=ON", "-DGGML_AVX2=ON", "-DGGML_FMA=ON", "-DGGML_F16C=ON",
+                  "-DGGML_AVX_VNNI=ON", "-DGGML_BMI2=ON",
+                  "-DGGML_AVX512=OFF", "-DGGML_AVX512_VBMI=OFF", "-DGGML_AVX512_VNNI=OFF", "-DGGML_AVX512_BF16=OFF")
+}
+OK "CPU target: $CpuTarget"
+
+# Web UI. llama.cpp provisions the server UI at configure time: with
+# LLAMA_BUILD_UI=ON it runs npm (skipped automatically when npm is missing),
+# otherwise it downloads the prebuilt assets from Hugging Face. The download
+# fails on some Windows machines (CMake's bundled curl: "SSL connect error"),
+# so building with npm is the robust default whenever npm is installed.
+$uiFlags = @()
+$npmAvailable = (Is-Available "npm") -or (Is-Available "npm.cmd")
+if ($BuildUi -or $npmAvailable) {
+    $uiFlags = @("-DLLAMA_BUILD_UI=ON")
+    if ($npmAvailable) { OK "Web UI: built from source with npm" } else { WARN "Web UI: npm not found - CMake falls back to downloading the prebuilt UI" }
+} else {
+    WARN "Web UI: npm not found - CMake downloads the prebuilt UI at build time (needs internet; install Node.js if that fails)"
+}
+
+$buildTargetArgs = @()
+if ($targetList.Count -gt 0) { $buildTargetArgs = @("--target") + $targetList; OK "Targets: $($targetList -join ', ')" }
+
+function Show-Result {
+    param([string]$BinPath, [string]$Label)
+    Log "BUILD SUCCESSFUL! ($Label)"
+    OK "Binaries: $BinPath"
+    $exes = Get-ChildItem $BinPath -Filter "*.exe" -ErrorAction SilentlyContinue
+    if ($exes) { $exes | ForEach-Object { OK "  $($_.Name)" } }
+    Write-Host "`nStart server:" -ForegroundColor Green
+    Write-Host "  $BinPath\llama-server.exe -m <model.gguf> --host 0.0.0.0 --port 8080" -ForegroundColor Green
 }
 
 # --- SYCL uses a completely different build process ---
@@ -1038,13 +1241,12 @@ if ($BuildType -eq "SYCL") {
         "-DCMAKE_CXX_COMPILER=icx",
         "-DGGML_SYCL=ON",
         "-DGGML_SYCL_F16=ON",
-        "-DGGML_NATIVE=ON",
         "-DBUILD_SHARED_LIBS=ON", "-DLLAMA_BUILD_SERVER=ON",
         "-DLLAMA_CURL=OFF", "-DGGML_CCACHE=OFF"
-    )
+    ) + $cpuFlags + $uiFlags
 
-    Log "Starting SYCL build: $CMAKE_EXE $($cmakeFlags -join ' ')"
     if ($extraFlagList.Count -gt 0) { $cmakeFlags += $extraFlagList; Log "Extra flags: $($extraFlagList -join ' ')" }
+    Log "Starting SYCL build: $CMAKE_EXE $($cmakeFlags -join ' ')"
     & $CMAKE_EXE @cmakeFlags
 
     if ($LASTEXITCODE -ne 0) {
@@ -1053,37 +1255,23 @@ if ($BuildType -eq "SYCL") {
     }
     OK "CMake configuration successful (SYCL/Ninja)"
 
-    # Build
     Log "Compiling $Source with SYCL using $ParallelJobs jobs..."
-    & $CMAKE_EXE --build $buildDir --parallel $ParallelJobs
+    & $CMAKE_EXE --build $buildDir --parallel $ParallelJobs @buildTargetArgs
 
     if ($LASTEXITCODE -ne 0) {
         WARN "Build failed! Code: $LASTEXITCODE"
         exit 1
     }
 
-    # --- COPY SYCL RUNTIME DLLs ---
-    # The built executables depend on oneAPI SYCL runtime DLLs that are NOT
-    # placed next to the binaries automatically. Copy them so llama-server.exe
-    # / llama-cli.exe start without "sycl8.dll not found" errors.
     Log "Copying Intel oneAPI SYCL runtime DLLs"
     $syclBin = Join-Path $buildDir "bin"
     Copy-SyclRuntimeDlls -TargetDir $syclBin | Out-Null
 
-    # --- DONE ---
-    Log "BUILD SUCCESSFUL! (SYCL)"
-    $binPath = Join-Path $buildDir "bin"
-    OK "Binaries: $binPath"
-    $exes = Get-ChildItem $binPath -Filter "*.exe" -ErrorAction SilentlyContinue
-    if ($exes) { $exes | ForEach-Object { OK "  $($_.Name)" } }
-    Write-Host "`nStart server:" -ForegroundColor Green
-    Write-Host "  $binPath\llama-server.exe -m <model.gguf> --host 0.0.0.0 --port 8080" -ForegroundColor Green
+    Show-Result -BinPath (Join-Path $buildDir "bin") -Label "SYCL"
     exit 0
 }
 
 # --- HIP builds use Ninja + the AMD HIP SDK clang (NOT the VS generator) ---
-# CMake does not support the HIP language on Windows, so ggml-hip forces the
-# hipcc/clang compiler. Building with the VS generator + MSVC cannot work.
 if ($BuildType -eq "HIP") {
     $clangExe = Join-Path $hipClangBin "clang.exe"
     $clangxxExe = Join-Path $hipClangBin "clang++.exe"
@@ -1101,11 +1289,13 @@ if ($BuildType -eq "HIP") {
         "-DCMAKE_CXX_COMPILER=$clangxxExe",
         "-DGGML_HIP=ON",
         "-DGGML_CUDA=OFF",
-        "-DGGML_NATIVE=ON",
-        "-DBUILD_SHARED_LIBS=ON", "-DLLAMA_BUILD_SERVER=ON",
+        "-DBUILD_SHARED_LIBS=OFF", "-DLLAMA_BUILD_SERVER=ON",
         "-DLLAMA_CURL=OFF", "-DGGML_CCACHE=OFF"
-    )
-    if ($amdGfxTarget) { $cmakeFlags += "-DGPU_TARGETS=$amdGfxTarget" }
+    ) + $cpuFlags + $uiFlags
+    if ($amdGfxTarget -and -not (Test-ExtraFlag "-DGPU_TARGETS=")) { $cmakeFlags += "-DGPU_TARGETS=$amdGfxTarget" }
+    if ($hipResourceDir) {
+        $cmakeFlags += @("-DCMAKE_C_FLAGS=-resource-dir=$hipResourceDir", "-DCMAKE_CXX_FLAGS=-resource-dir=$hipResourceDir")
+    }
     if ($extraFlagList.Count -gt 0) { $cmakeFlags += $extraFlagList; Log "Extra flags: $($extraFlagList -join ' ')" }
 
     Log "Starting HIP build: $CMAKE_EXE $($cmakeFlags -join ' ')"
@@ -1113,83 +1303,51 @@ if ($BuildType -eq "HIP") {
     if ($LASTEXITCODE -ne 0) { WARN "CMake configuration failed! Code: $LASTEXITCODE"; exit 1 }
     OK "CMake configuration successful (HIP/Ninja)"
 
-    Log "Compiling $Source with HIP using $ParallelJobs jobs..."
-    & $CMAKE_EXE --build $buildDir --parallel $ParallelJobs
+    # HIP device compilation is memory hungry: cap the parallelism.
+    $hipJobs = [Math]::Min($ParallelJobs, 12)
+    Log "Compiling $Source with HIP using $hipJobs jobs..."
+    & $CMAKE_EXE --build $buildDir --parallel $hipJobs @buildTargetArgs
     if ($LASTEXITCODE -ne 0) { WARN "Build failed! Code: $LASTEXITCODE"; exit 1 }
 
-    Log "BUILD SUCCESSFUL! (HIP)"
-    $binPath = Join-Path $buildDir "bin"
-    OK "Binaries: $binPath"
-    $exes = Get-ChildItem $binPath -Filter "*.exe" -ErrorAction SilentlyContinue
-    if ($exes) { $exes | ForEach-Object { OK "  $($_.Name)" } }
-    Write-Host "`nStart server:" -ForegroundColor Green
-    Write-Host "  $binPath\llama-server.exe -m <model.gguf> --host 0.0.0.0 --port 8080" -ForegroundColor Green
+    $hipBin = Join-Path $buildDir "bin"
+    Log "Bundling ROCm runtime next to the executables"
+    Copy-HipRuntimeDependencies -BinDir $hipBin -HipRoot $hipRoot
+
+    Show-Result -BinPath $hipBin -Label "HIP"
     exit 0
 }
 
-# --- Non-SYCL builds use Visual Studio generator ---
-$vsWhere2 = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vsPath2   = & $vsWhere2 -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
-$vsVersion = & $vsWhere2 -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion 2>$null
-
-$vsMajor = [int]($vsVersion.Split(".")[0])
-$vsGenerator = switch ($vsMajor) {
-    18 { "Visual Studio 18 2026" }
-    17 { "Visual Studio 17 2022" }
-    16 { "Visual Studio 16 2019" }
-    15 { "Visual Studio 15 2017" }
-    14 { "Visual Studio 14 2015" }
-    default { 
-        # Für zukünftige Versionen: Verwende die gefundene Version
-        "Visual Studio $vsMajor $($vsVersion.Split('.')[0])"
-    }
-}
-OK "VS: $vsPath2 (v$vsVersion -> $vsGenerator)"
-
-$msvcClExe = Resolve-MsvcClPath -VsInstallPath $vsPath2
-if (-not $msvcClExe) {
-    WARN "Could not locate MSVC cl.exe under: $vsPath2"
-    WARN "Install the C++ workload / MSVC x64 tools in Visual Studio Installer."
-    exit 1
-}
+# --- Non-SYCL/HIP builds use the Visual Studio generator ---
+$vsGenerator = $vs.Generator
+OK "VS: $($vs.Path) (v$($vs.Version) -> $vsGenerator)"
 Add-ToPath (Split-Path -Parent $msvcClExe)
-OK "MSVC cl.exe: $msvcClExe"
 
-# Build the web UI from source when requested (before CMake configure,
-# because LLAMA_USE_PREBUILT_UI=OFF expects the prebuilt assets present).
-if ($BuildUi) {
-    Build-WebUi -RepoDir $dir | Out-Null
-}
-
-# Build-specific flags. BUILD_SHARED_LIBS is chosen per backend:
-#  - Vulkan (RDNA4): OFF (matches the proven static recipe)
-#  - CUDA / HIP / CPU: ON
-# GGML_NATIVE=ON lets llama.cpp auto-detect every available CPU ISA
-# (AVX2/AVX512/FMA/F16C/AMX) instead of forcing AVX2-only.
 $cmakeFlags = @(
     "-S", $dir, "-B", $buildDir,
     "-G", $vsGenerator, "-A", "x64",
     "-DCMAKE_BUILD_TYPE=Release",
-    "-DGGML_NATIVE=ON",
     "-DLLAMA_BUILD_SERVER=ON",
     "-DLLAMA_CURL=OFF", "-DGGML_CCACHE=OFF"
-)
+) + $cpuFlags + $uiFlags
 
 if ($BuildType -eq "CUDA") {
-    $cmakeFlags += @("-DGGML_CUDA=ON", "-DGGML_VULKAN=OFF", "-DBUILD_SHARED_LIBS=ON")
-    
-    # Set CUDA toolkit path explicitly
+    $cmakeFlags += @("-DGGML_CUDA=ON", "-DGGML_VULKAN=OFF", "-DBUILD_SHARED_LIBS=OFF")
     if ($cudaInstallDir) {
         $cmakeFlags += "-DCUDAToolkit_ROOT=$cudaInstallDir"
-        $cmakeFlags += "-DCUDA_TOOLKIT_ROOT_DIR=$cudaInstallDir"
-        
-        # If CUDA props were copied locally, copy them to the build directory
-        $localCudaProps = Join-Path $buildDir "CUDA_Props"
-        if (Test-Path $localCudaProps) {
-            # Copy CUDA props to build directory for CMake to find
-            Copy-Item "$localCudaProps\*" $buildDir -Force
-            OK "CUDA props copied to build directory"
+        # Visual Studio generators pick the CUDA toolset via -T, not CMAKE_CUDA_COMPILER.
+        $cmakeFlags += @("-T", "cuda=$cudaInstallDir")
+    }
+    # Compile only for the GPUs in this machine (fast build, smaller binary)
+    # unless the user pinned CMAKE_CUDA_ARCHITECTURES via extra flags.
+    if ($nvidiaInfo -and $nvidiaInfo.ComputeCaps.Count -gt 0 -and -not (Test-ExtraFlag "-DCMAKE_CUDA_ARCHITECTURES=")) {
+        $archs = @()
+        foreach ($cc in $nvidiaInfo.ComputeCaps) {
+            $num = [int]($cc.Split('.')[0]) * 10 + [int]($cc.Split('.')[1])
+            $arch = if ($num -ge 120) { "${num}a-real" } else { "${num}-real" }
+            if ($archs -notcontains $arch) { $archs += $arch }
         }
+        $cmakeFlags += "-DCMAKE_CUDA_ARCHITECTURES=$($archs -join ';')"
+        OK "CUDA architectures: $($archs -join ';')"
     }
 } elseif ($BuildType -eq "Vulkan") {
     # RDNA4 (Radeon RX 9000) Vulkan recipe: Vulkan backend + recent
@@ -1218,22 +1376,13 @@ if ($BuildType -eq "CUDA") {
         $cmakeFlags += "-DCMAKE_PREFIX_PATH=$spirvPrefix"
         OK "Using SPIRV-Headers prefix: $spirvPrefix"
     }
-    if ($BuildUi) {
-        $cmakeFlags += @("-DLLAMA_BUILD_UI=ON", "-DLLAMA_USE_PREBUILT_UI=OFF")
-    }
-} elseif ($BuildType -eq "HIP") {
-    # NOTE: HIP on Windows is handled by the dedicated Ninja+clang branch
-    # above (CMake's HIP language is unsupported with the VS generator).
-    # If we get here, something went wrong — fall back to a safe CPU build.
-    WARN "HIP build should have been handled earlier; falling back to CPU."
-    $cmakeFlags += @("-DGGML_CUDA=OFF", "-DGGML_VULKAN=OFF", "-DBUILD_SHARED_LIBS=ON")
 } else {
     # CPU
-    $cmakeFlags += @("-DGGML_CUDA=OFF", "-DGGML_VULKAN=OFF", "-DBUILD_SHARED_LIBS=ON")
+    $cmakeFlags += @("-DGGML_CUDA=OFF", "-DGGML_VULKAN=OFF", "-DBUILD_SHARED_LIBS=OFF")
 }
 
-Log "Starting: $CMAKE_EXE $($cmakeFlags -join ' ')"
 if ($extraFlagList.Count -gt 0) { $cmakeFlags += $extraFlagList; Log "Extra flags: $($extraFlagList -join ' ')" }
+Log "Starting: $CMAKE_EXE $($cmakeFlags -join ' ')"
 & $CMAKE_EXE @cmakeFlags
 
 if ($LASTEXITCODE -ne 0) {
@@ -1244,18 +1393,22 @@ OK "CMake configuration successful"
 
 # --- 10. BUILD ---
 Log "Compiling $Source with $BuildType using $ParallelJobs jobs..."
-& $CMAKE_EXE --build $buildDir --config Release --parallel $ParallelJobs
+& $CMAKE_EXE --build $buildDir --config Release --parallel $ParallelJobs @buildTargetArgs
 
 if ($LASTEXITCODE -ne 0) {
     WARN "Build failed! Code: $LASTEXITCODE"
     exit 1
 }
 
-# --- DONE ---
-Log "BUILD SUCCESSFUL!"
 $binPath = Join-Path $buildDir "bin\Release"
-OK "Binaries: $binPath"
-$exes = Get-ChildItem $binPath -Filter "*.exe" -ErrorAction SilentlyContinue
-if ($exes) { $exes | ForEach-Object { OK "  $($_.Name)" } }
-Write-Host "`nStart server:" -ForegroundColor Green
-Write-Host "  $binPath\llama-server.exe -m <model.gguf> --host 0.0.0.0 --port 8080" -ForegroundColor Green
+if ($BuildType -eq "CUDA" -and $cudaInstallDir) {
+    # Static cudart is linked, but cuBLAS stays dynamic: ship its DLLs.
+    $copied = 0
+    foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+        Get-ChildItem -Path (Join-Path $cudaInstallDir "bin") -Filter $pattern -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName -Destination $binPath -Force; $copied++
+        }
+    }
+    OK "Bundled $copied CUDA runtime DLL(s)"
+}
+Show-Result -BinPath $binPath -Label $BuildType

@@ -3,14 +3,6 @@
     "name": "CPU",
     "build_type": "CPU",
     "cmake_flags": [
-      "-DGGML_NATIVE=OFF",
-      "-DGGML_AVX2=ON",
-      "-DGGML_AVX_VNNI=ON",
-      "-DGGML_BMI2=ON",
-      "-DGGML_AVX512=OFF",
-      "-DGGML_AVX512_VBMI=OFF",
-      "-DGGML_AVX512_VNNI=OFF",
-      "-DGGML_AVX512_BF16=OFF",
       "-DGGML_LTO=OFF",
       "-DBUILD_SHARED_LIBS=OFF",
       "-DLLAMA_BUILD_SERVER=ON",
@@ -21,30 +13,45 @@
       "-DGGML_CCACHE=OFF"
     ],
     "clean_build": true,
-    "update_repo": true,
-    "test_after_build": false
+    "update_repo": true
   },
   {
-    "name": "CUDA NVIDIA",
+    "name": "CUDA 12.x NVIDIA",
     "build_type": "CUDA",
+    "cuda_major": "12",
     "cmake_flags": [
-      "-DLLAMA_BUILD_IS_DEV=ON",
       "-DGGML_CUDA=ON",
       "-DGGML_VULKAN=OFF",
-      "-DGGML_NATIVE=OFF",
-      "-DGGML_AVX2=ON",
-      "-DGGML_FMA=ON",
-      "-DGGML_F16C=ON",
+      "-DGGML_LTO=OFF",
       "-DBUILD_SHARED_LIBS=OFF",
       "-DLLAMA_BUILD_SERVER=ON",
-      "-DLLAMA_BUILD_UI=ON",
-      "-DLLAMA_USE_PREBUILT_UI=ON",
+      "-DLLAMA_BUILD_TESTS=OFF",
+      "-DLLAMA_BUILD_TOOLS=ON",
+      "-DLLAMA_BUILD_EXAMPLES=ON",
       "-DLLAMA_CURL=OFF",
       "-DGGML_CCACHE=OFF"
     ],
     "clean_build": true,
-    "update_repo": true,
-    "test_after_build": true
+    "update_repo": true
+  },
+  {
+    "name": "CUDA 13.x NVIDIA",
+    "build_type": "CUDA",
+    "cuda_major": "13",
+    "cmake_flags": [
+      "-DGGML_CUDA=ON",
+      "-DGGML_VULKAN=OFF",
+      "-DGGML_LTO=OFF",
+      "-DBUILD_SHARED_LIBS=OFF",
+      "-DLLAMA_BUILD_SERVER=ON",
+      "-DLLAMA_BUILD_TESTS=OFF",
+      "-DLLAMA_BUILD_TOOLS=ON",
+      "-DLLAMA_BUILD_EXAMPLES=ON",
+      "-DLLAMA_CURL=OFF",
+      "-DGGML_CCACHE=OFF"
+    ],
+    "clean_build": true,
+    "update_repo": true
   },
   {
     "name": "Vulkan",
@@ -52,22 +59,12 @@
     "cmake_flags": [
       "-DGGML_VULKAN=ON",
       "-DGGML_HIP=OFF",
-      "-DGGML_NATIVE=OFF",
-      "-DGGML_AVX2=ON",
-      "-DGGML_AVX_VNNI=ON",
-      "-DGGML_BMI2=ON",
-      "-DGGML_AVX512=OFF",
-      "-DGGML_AVX512_VBMI=OFF",
-      "-DGGML_AVX512_VNNI=OFF",
-      "-DGGML_AVX512_BF16=OFF",
       "-DGGML_LTO=OFF",
       "-DBUILD_SHARED_LIBS=OFF",
       "-DLLAMA_BUILD_SERVER=ON",
       "-DLLAMA_BUILD_TESTS=OFF",
       "-DLLAMA_BUILD_TOOLS=ON",
       "-DLLAMA_BUILD_EXAMPLES=ON",
-      "-DLLAMA_BUILD_UI=ON",
-      "-DLLAMA_USE_PREBUILT_UI=ON",
       "-DLLAMA_CURL=OFF",
       "-DGGML_CCACHE=OFF",
       "-DGGML_VULKAN_CHECK_RESULTS=OFF",
@@ -78,8 +75,7 @@
       "-DGGML_VULKAN_RUN_TESTS=OFF"
     ],
     "clean_build": true,
-    "update_repo": true,
-    "test_after_build": false
+    "update_repo": true
   },
   {
     "name": "HIP ROCm AMD",
@@ -87,37 +83,23 @@
     "cmake_flags": [
       "-DGGML_HIP=ON",
       "-DGGML_VULKAN=OFF",
-      "-DGPU_TARGETS=gfx1201",
       "-DGGML_HIP_GRAPHS=ON",
       "-DGGML_HIP_NO_VMM=ON",
       "-DGGML_HIP_RCCL=OFF",
       "-DGGML_CUDA_NO_PEER_COPY=ON",
       "-DGGML_CUDA_FA=ON",
       "-DGGML_CUDA_FA_ALL_QUANTS=ON",
-      "-DGGML_FMA=ON",
-      "-DGGML_F16C=ON",
-      "-DGGML_NATIVE=OFF",
-      "-DGGML_AVX2=ON",
-      "-DGGML_AVX_VNNI=ON",
-      "-DGGML_BMI2=ON",
-      "-DGGML_AVX512=OFF",
-      "-DGGML_AVX512_VBMI=OFF",
-      "-DGGML_AVX512_VNNI=OFF",
-      "-DGGML_AVX512_BF16=OFF",
       "-DGGML_LTO=OFF",
       "-DBUILD_SHARED_LIBS=OFF",
       "-DLLAMA_BUILD_SERVER=ON",
       "-DLLAMA_BUILD_TESTS=OFF",
       "-DLLAMA_BUILD_TOOLS=ON",
       "-DLLAMA_BUILD_EXAMPLES=ON",
-      "-DLLAMA_BUILD_UI=ON",
-      "-DLLAMA_USE_PREBUILT_UI=ON",
       "-DLLAMA_CURL=OFF",
       "-DGGML_CCACHE=OFF"
     ],
     "clean_build": true,
-    "update_repo": true,
-    "test_after_build": false
+    "update_repo": true
   },
   {
     "name": "SYCL Intel GPU",
@@ -132,12 +114,12 @@
       "-DGGML_CCACHE=OFF"
     ],
     "clean_build": true,
-    "update_repo": true,
-    "test_after_build": false
+    "update_repo": true
   },
   {
-    "name": "Metal macOS",
+    "name": "Metal (Apple Silicon)",
     "build_type": "Metal",
+    "platform": "darwin-arm64",
     "cmake_flags": [
       "-DGGML_METAL=ON",
       "-DGGML_METAL_EMBED_LIBRARY=ON",
@@ -149,7 +131,43 @@
       "-DGGML_CCACHE=OFF"
     ],
     "clean_build": true,
-    "update_repo": true,
-    "test_after_build": false
+    "update_repo": true
+  },
+  {
+    "name": "CPU (Intel Mac)",
+    "build_type": "CPU",
+    "platform": "darwin-x86_64",
+    "cmake_flags": [
+      "-DGGML_METAL=OFF",
+      "-DGGML_LTO=OFF",
+      "-DBUILD_SHARED_LIBS=OFF",
+      "-DLLAMA_BUILD_SERVER=ON",
+      "-DLLAMA_BUILD_TESTS=OFF",
+      "-DLLAMA_BUILD_TOOLS=ON",
+      "-DLLAMA_BUILD_EXAMPLES=ON",
+      "-DLLAMA_CURL=OFF",
+      "-DGGML_CCACHE=OFF"
+    ],
+    "clean_build": true,
+    "update_repo": true
+  },
+  {
+    "name": "Vulkan (Intel Mac, MoltenVK)",
+    "build_type": "Vulkan",
+    "platform": "darwin-x86_64",
+    "cmake_flags": [
+      "-DGGML_VULKAN=ON",
+      "-DGGML_METAL=OFF",
+      "-DGGML_LTO=OFF",
+      "-DBUILD_SHARED_LIBS=OFF",
+      "-DLLAMA_BUILD_SERVER=ON",
+      "-DLLAMA_BUILD_TESTS=OFF",
+      "-DLLAMA_BUILD_TOOLS=ON",
+      "-DLLAMA_BUILD_EXAMPLES=ON",
+      "-DLLAMA_CURL=OFF",
+      "-DGGML_CCACHE=OFF"
+    ],
+    "clean_build": true,
+    "update_repo": true
   }
 ]
