@@ -60,7 +60,7 @@ def get_source_by_name(name):
 
 def add_source(name, repo_url, branch, local_path=None, source_type="custom",
                experimental=True, default_cmake_flags=None, commit="",
-               fetch_ref=""):
+               fetch_ref="", dir_suffix=""):
     """Add a new build source."""
     sources = load_sources()
 
@@ -90,6 +90,9 @@ def add_source(name, repo_url, branch, local_path=None, source_type="custom",
         new_source["commit"] = commit
     if fetch_ref:
         new_source["fetch_ref"] = fetch_ref
+    if dir_suffix:
+        # Auto-Tuner-compatible output folder suffix (must end in "_llama.cpp").
+        new_source["dir_suffix"] = dir_suffix
 
     sources.append(new_source)
     save_sources(sources)

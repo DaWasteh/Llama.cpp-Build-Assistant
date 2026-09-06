@@ -112,54 +112,56 @@ DEFAULT_BUILD_SOURCES = [
     }
 ]
 
-# Default build profiles
+# Default build profiles.
+#
+# CPU instruction-set flags (AVX2/AVX512/GGML_NATIVE) are NOT part of the
+# profiles any more: they come from the "CPU target" option in the build tab
+# (portable AVX2 vs. native for this machine), so a profile never silently
+# pins the CPU ISA. Optional hints understood by hardware_check.select_profile_name:
+#   "cuda_major": "12" | "13"    toolkit generation the profile is meant for
+#   "platform":   "darwin-arm64" | "darwin-x86_64"   restrict auto-selection
+_COMMON_OUTPUT_FLAGS = [
+    "-DLLAMA_BUILD_SERVER=ON",
+    "-DLLAMA_BUILD_TESTS=OFF",
+    "-DLLAMA_BUILD_TOOLS=ON",
+    "-DLLAMA_BUILD_EXAMPLES=ON",
+    "-DLLAMA_CURL=OFF",
+    "-DGGML_CCACHE=OFF",
+]
+
+_CUDA_FLAGS = [
+    "-DGGML_CUDA=ON",
+    "-DGGML_VULKAN=OFF",
+    "-DGGML_LTO=OFF",
+    "-DBUILD_SHARED_LIBS=OFF",
+] + _COMMON_OUTPUT_FLAGS
+
 DEFAULT_BUILD_PROFILES = [
     {
         "name": "CPU",
         "build_type": "CPU",
         "cmake_flags": [
-            "-DGGML_NATIVE=OFF",
-            "-DGGML_AVX2=ON",
-            "-DGGML_AVX_VNNI=ON",
-            "-DGGML_BMI2=ON",
-            "-DGGML_AVX512=OFF",
-            "-DGGML_AVX512_VBMI=OFF",
-            "-DGGML_AVX512_VNNI=OFF",
-            "-DGGML_AVX512_BF16=OFF",
             "-DGGML_LTO=OFF",
             "-DBUILD_SHARED_LIBS=OFF",
-            "-DLLAMA_BUILD_SERVER=ON",
-            "-DLLAMA_BUILD_TESTS=OFF",
-            "-DLLAMA_BUILD_TOOLS=ON",
-            "-DLLAMA_BUILD_EXAMPLES=ON",
-            "-DLLAMA_CURL=OFF",
-            "-DGGML_CCACHE=OFF"
-        ],
+        ] + _COMMON_OUTPUT_FLAGS,
         "clean_build": True,
         "update_repo": True,
-        "test_after_build": False
     },
     {
-        "name": "CUDA NVIDIA",
+        "name": "CUDA 12.x NVIDIA",
         "build_type": "CUDA",
-        "cmake_flags": [
-            "-DLLAMA_BUILD_IS_DEV=ON",
-            "-DGGML_CUDA=ON",
-            "-DGGML_VULKAN=OFF",
-            "-DGGML_NATIVE=OFF",
-            "-DGGML_AVX2=ON",
-            "-DGGML_FMA=ON",
-            "-DGGML_F16C=ON",
-            "-DBUILD_SHARED_LIBS=OFF",
-            "-DLLAMA_BUILD_SERVER=ON",
-            "-DLLAMA_BUILD_UI=ON",
-            "-DLLAMA_USE_PREBUILT_UI=ON",
-            "-DLLAMA_CURL=OFF",
-            "-DGGML_CCACHE=OFF"
-        ],
+        "cuda_major": "12",
+        "cmake_flags": list(_CUDA_FLAGS),
         "clean_build": True,
         "update_repo": True,
-        "test_after_build": True
+    },
+    {
+        "name": "CUDA 13.x NVIDIA",
+        "build_type": "CUDA",
+        "cuda_major": "13",
+        "cmake_flags": list(_CUDA_FLAGS),
+        "clean_build": True,
+        "update_repo": True,
     },
     {
         "name": "Vulkan",
@@ -167,72 +169,39 @@ DEFAULT_BUILD_PROFILES = [
         "cmake_flags": [
             "-DGGML_VULKAN=ON",
             "-DGGML_HIP=OFF",
-            "-DGGML_NATIVE=OFF",
-            "-DGGML_AVX2=ON",
-            "-DGGML_AVX_VNNI=ON",
-            "-DGGML_BMI2=ON",
-            "-DGGML_AVX512=OFF",
-            "-DGGML_AVX512_VBMI=OFF",
-            "-DGGML_AVX512_VNNI=OFF",
-            "-DGGML_AVX512_BF16=OFF",
             "-DGGML_LTO=OFF",
             "-DBUILD_SHARED_LIBS=OFF",
-            "-DLLAMA_BUILD_SERVER=ON",
-            "-DLLAMA_BUILD_TESTS=OFF",
-            "-DLLAMA_BUILD_TOOLS=ON",
-            "-DLLAMA_BUILD_EXAMPLES=ON",
-            "-DLLAMA_BUILD_UI=ON",
-            "-DLLAMA_USE_PREBUILT_UI=ON",
-            "-DLLAMA_CURL=OFF",
-            "-DGGML_CCACHE=OFF",
+        ] + _COMMON_OUTPUT_FLAGS + [
             "-DGGML_VULKAN_CHECK_RESULTS=OFF",
             "-DGGML_VULKAN_DEBUG=OFF",
             "-DGGML_VULKAN_MEMORY_DEBUG=OFF",
             "-DGGML_VULKAN_SHADER_DEBUG_INFO=OFF",
             "-DGGML_VULKAN_VALIDATE=OFF",
-            "-DGGML_VULKAN_RUN_TESTS=OFF"
+            "-DGGML_VULKAN_RUN_TESTS=OFF",
         ],
         "clean_build": True,
         "update_repo": True,
-        "test_after_build": False
     },
     {
+        # GPU_TARGETS is intentionally absent: the build script detects the
+        # installed gfx target(s) (hipInfo / rocminfo) so the binary matches
+        # the GPU that is actually present.
         "name": "HIP ROCm AMD",
         "build_type": "HIP",
         "cmake_flags": [
             "-DGGML_HIP=ON",
             "-DGGML_VULKAN=OFF",
-            "-DGPU_TARGETS=gfx1201",
             "-DGGML_HIP_GRAPHS=ON",
             "-DGGML_HIP_NO_VMM=ON",
             "-DGGML_HIP_RCCL=OFF",
             "-DGGML_CUDA_NO_PEER_COPY=ON",
             "-DGGML_CUDA_FA=ON",
             "-DGGML_CUDA_FA_ALL_QUANTS=ON",
-            "-DGGML_FMA=ON",
-            "-DGGML_F16C=ON",
-            "-DGGML_NATIVE=OFF",
-            "-DGGML_AVX2=ON",
-            "-DGGML_AVX_VNNI=ON",
-            "-DGGML_BMI2=ON",
-            "-DGGML_AVX512=OFF",
-            "-DGGML_AVX512_VBMI=OFF",
-            "-DGGML_AVX512_VNNI=OFF",
-            "-DGGML_AVX512_BF16=OFF",
             "-DGGML_LTO=OFF",
             "-DBUILD_SHARED_LIBS=OFF",
-            "-DLLAMA_BUILD_SERVER=ON",
-            "-DLLAMA_BUILD_TESTS=OFF",
-            "-DLLAMA_BUILD_TOOLS=ON",
-            "-DLLAMA_BUILD_EXAMPLES=ON",
-            "-DLLAMA_BUILD_UI=ON",
-            "-DLLAMA_USE_PREBUILT_UI=ON",
-            "-DLLAMA_CURL=OFF",
-            "-DGGML_CCACHE=OFF"
-        ],
+        ] + _COMMON_OUTPUT_FLAGS,
         "clean_build": True,
         "update_repo": True,
-        "test_after_build": False
     },
     {
         "name": "SYCL Intel GPU",
@@ -248,11 +217,11 @@ DEFAULT_BUILD_PROFILES = [
         ],
         "clean_build": True,
         "update_repo": True,
-        "test_after_build": False
     },
     {
-        "name": "Metal macOS",
+        "name": "Metal (Apple Silicon)",
         "build_type": "Metal",
+        "platform": "darwin-arm64",
         "cmake_flags": [
             "-DGGML_METAL=ON",
             "-DGGML_METAL_EMBED_LIBRARY=ON",
@@ -265,9 +234,62 @@ DEFAULT_BUILD_PROFILES = [
         ],
         "clean_build": True,
         "update_repo": True,
-        "test_after_build": False
-    }
+    },
+    {
+        # Upstream builds its macOS x64 releases with GGML_METAL=OFF; Metal is
+        # not maintained for Intel Macs with AMD/Intel GPUs.
+        "name": "CPU (Intel Mac)",
+        "build_type": "CPU",
+        "platform": "darwin-x86_64",
+        "cmake_flags": [
+            "-DGGML_METAL=OFF",
+            "-DGGML_LTO=OFF",
+            "-DBUILD_SHARED_LIBS=OFF",
+        ] + _COMMON_OUTPUT_FLAGS,
+        "clean_build": True,
+        "update_repo": True,
+    },
+    {
+        "name": "Vulkan (Intel Mac, MoltenVK)",
+        "build_type": "Vulkan",
+        "platform": "darwin-x86_64",
+        "cmake_flags": [
+            "-DGGML_VULKAN=ON",
+            "-DGGML_METAL=OFF",
+            "-DGGML_LTO=OFF",
+            "-DBUILD_SHARED_LIBS=OFF",
+        ] + _COMMON_OUTPUT_FLAGS,
+        "clean_build": True,
+        "update_repo": True,
+    },
 ]
+
+# Auto-Tuner-compatible checkout folder suffix per source id. Output folders
+# are named "<bNNNN>_<backend>_<suffix>", e.g. "b10830_vulkan_llama.cpp";
+# the Auto-Tuner only recognises names ending in "_llama.cpp".
+DEFAULT_DIR_SUFFIXES = {
+    "main": "llama.cpp",
+    "turboquant": "tq_llama.cpp",
+    "ternary_bonsai": "2b_llama.cpp",
+    "ocr_llama": "ocr_llama.cpp",
+    "diffusion_gemma": "d_llama.cpp",
+}
+
+
+def get_dir_suffix(source):
+    """Checkout folder suffix for a source dict (see DEFAULT_DIR_SUFFIXES)."""
+    import re as _re
+    explicit = (source or {}).get("dir_suffix")
+    if explicit:
+        return explicit
+    source_id = (source or {}).get("id", "") or "custom"
+    if source_id in DEFAULT_DIR_SUFFIXES:
+        return DEFAULT_DIR_SUFFIXES[source_id]
+    stem = _re.sub(r"[^a-z0-9]+", "_", source_id.lower()).strip("_") or "custom"
+    if stem.endswith("llama_cpp"):
+        stem = stem[:-len("llama_cpp")].rstrip("_")
+    return f"{stem}_llama.cpp" if stem else "llama.cpp"
+
 
 # Required programs for building
 REQUIRED_FOR_ALL = ["git", "cmake", "compiler"]

@@ -24,7 +24,8 @@ from config import (
     DEFAULT_BUILD_SOURCES, DEFAULT_BUILD_PROFILES,
     BUILD_TYPES, BUILD_TYPE_DISPLAY, BUILD_TYPE_FLAGS
 )
-from hardware_check import run_full_check, get_recommendation
+from hardware_check import (run_full_check, get_recommendation, get_recommendation_reason,
+                            select_profile_name, recommend_cuda_major)
 from dependency_checker import check_all, get_missing_for_build_type, get_missing_programs_text
 from dependency_installer import (
     has_winget, has_sudo, install_missing, check_after_install,
@@ -37,9 +38,8 @@ from source_manager import (
 )
 from builder import (
     run_build, save_build_result, get_build_history,
-    get_error_explanation, get_build_path
+    get_error_explanation, get_build_path, extract_error_lines, CPU_TARGETS
 )
-from repo_manager import ensure_repo
 from profile_manager import load_profiles, add_profile, edit_profile, delete_profile, get_profile_by_name
 from logger import log_build, log_error, log_warning, log_install
 
@@ -577,11 +577,33 @@ class BuildAssistantApp(ctk.CTk):
                          font=ctk.CTkFont(size=13)).pack(
             padx=20, pady=4, anchor="w")
 
-        self.build_ui_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(opt_frame, text="Build web UI (needs npm)",
+        self.build_ui_var = ctk.BooleanVar(value=bool(shutil.which("npm") or shutil.which("npm.cmd")))
+        ctk.CTkCheckBox(opt_frame, text="Build web UI with npm (unchecked: CMake downloads the prebuilt UI, needs internet)",
                          variable=self.build_ui_var,
                          font=ctk.CTkFont(size=13)).pack(
-            padx=20, pady=(4, 15), anchor="w")
+            padx=20, pady=4, anchor="w")
+
+        self.core_only_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(opt_frame, text="Core tools only (llama-server, llama-cli, llama-bench, llama-quantize)",
+                         variable=self.core_only_var,
+                         font=ctk.CTkFont(size=13)).pack(
+            padx=20, pady=4, anchor="w")
+
+        row = ctk.CTkFrame(opt_frame, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(8, 4))
+        ctk.CTkLabel(row, text="CPU target:", font=ctk.CTkFont(size=13)).pack(side="left")
+        self.cpu_target_var = ctk.StringVar(value="portable")
+        self.cpu_target_combo = self._style_combo(ctk.CTkComboBox(
+            row, values=["portable", "native"], variable=self.cpu_target_var, width=130, height=30))
+        self.cpu_target_combo.pack(side="left", padx=(8, 18))
+        ctk.CTkLabel(row, text="Parallel jobs:", font=ctk.CTkFont(size=13)).pack(side="left")
+        self.jobs_var = ctk.StringVar(value=str(os.cpu_count() or 4))
+        self.jobs_entry = self._style_field(ctk.CTkEntry(row, textvariable=self.jobs_var, width=70, height=30))
+        self.jobs_entry.pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(opt_frame, text="portable = AVX2/FMA/F16C, runs on any CPU since Haswell/Zen 1. "
+                                     "native = tuned for this PC (AVX-512/AMX), not portable.",
+                     font=ctk.CTkFont(size=11), text_color=MUTED, justify="left").pack(
+            padx=20, pady=(0, 15), anchor="w")
 
         btn_frame = self._card(scroll_frame)
         btn_frame.pack(fill="x", padx=25, pady=15)
@@ -753,11 +775,13 @@ class BuildAssistantApp(ctk.CTk):
 
         rec = get_recommendation(report)
         selected_profile = (self.selected_profile.get() if self._profile_manually_selected
-                            else self._select_profile_for_build_type(rec))
-        profile_hint = f" -> Profile: {selected_profile}" if selected_profile else ""
+                            else self._select_profile_for_report(report))
+        profile_hint = f"\nProfile: {selected_profile}" if selected_profile else ""
+        cpu_hint = self._cpu_target_hint(report)
         self.lbl_recommendation.configure(
             text=f"Recommended: {BUILD_TYPE_DISPLAY.get(rec, rec)} Build "
-                 f"({BUILD_TYPE_FLAGS.get(rec, '')}){profile_hint}")
+                 f"({BUILD_TYPE_FLAGS.get(rec, '')}){profile_hint}\n"
+                 f"{get_recommendation_reason(report)}\n{cpu_hint}")
 
         self._update_system_tab(report)
         self.status_label.configure(text="Hardware check complete")
@@ -780,6 +804,7 @@ class BuildAssistantApp(ctk.CTk):
         lines.append(f"  Model: {cpu.get('name', 'Unknown')}")
         lines.append(f"  Cores: {cpu.get('cores', 0)}")
         lines.append(f"  Threads: {cpu.get('threads', 0)}")
+        lines.append(f"  Architecture: {cpu.get('arch') or report.get('arch') or 'unknown'}")
         lines.append(f"  Features: {', '.join(cpu.get('features', [])) or 'None detected'}")
         lines.append("")
 
@@ -794,8 +819,13 @@ class BuildAssistantApp(ctk.CTk):
         gpus = gpu.get("gpus", [])
         if gpus:
             for g in gpus:
+                extra = ""
+                if g.get("compute_cap"):
+                    extra += f", compute capability {g['compute_cap']}"
+                if g.get("unified_memory"):
+                    extra += ", unified memory"
                 lines.append(f"  {g.get('name', 'Unknown')} ({g.get('vendor', 'Unknown')}, "
-                             f"{g.get('vram_gb', 0)} GB VRAM)")
+                             f"{g.get('vram_gb', 0)} GB VRAM{extra})")
         else:
             lines.append("  None detected")
         lines.append("")
@@ -806,9 +836,14 @@ class BuildAssistantApp(ctk.CTk):
             lines.append(f"  Driver Version: {gpu['nvidia_driver_version']}")
         lines.append(f"  CUDA: {'Available' if gpu.get('cuda_available') else 'Not available'}")
         if gpu.get('cuda_version'):
-            lines.append(f"  CUDA Version: {gpu['cuda_version']}")
+            lines.append(f"  CUDA Toolkit: {gpu['cuda_version']}")
+        if gpu.get('nvidia_driver_cuda_version'):
+            lines.append(f"  CUDA supported by driver: up to {gpu['nvidia_driver_cuda_version']}"
+                         f" (recommended toolkit: {recommend_cuda_major(report)}.x)")
         lines.append(f"  Vulkan: {'Available' if gpu.get('vulkan_available') else 'Not available'}")
         lines.append(f"  ROCm/HIP: {'Available' if gpu.get('rocm_available') else 'Not available'}")
+        if gpu.get('amd_gfx_targets'):
+            lines.append(f"  AMD gfx targets: {', '.join(gpu['amd_gfx_targets'])}")
         lines.append(f"  SYCL (Intel): {'Available' if gpu.get('sycl_available') else 'Not available'}")
         lines.append("")
 
@@ -818,6 +853,8 @@ class BuildAssistantApp(ctk.CTk):
         rec = get_recommendation(report)
         lines.append(f"Recommended Build: {BUILD_TYPE_DISPLAY.get(rec, rec)} "
                       f"({BUILD_TYPE_FLAGS.get(rec, '')})")
+        lines.append(f"  Why: {get_recommendation_reason(report)}")
+        lines.append(f"  {self._cpu_target_hint(report)}")
 
         self.sys_text.delete("1.0", "end")
         self.sys_text.insert("1.0", "\n".join(lines))
@@ -1073,6 +1110,11 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
         profile = get_profile_by_name(profile_name)
         if profile:
             self.selected_build_type.set(profile.get("build_type", "CPU"))
+            # Profiles only pre-fill the options; the checkboxes decide at build time.
+            if hasattr(self, "clean_build_var") and "clean_build" in profile:
+                self.clean_build_var.set(bool(profile.get("clean_build")))
+            if hasattr(self, "update_repo_var") and "update_repo" in profile:
+                self.update_repo_var.set(bool(profile.get("update_repo")))
 
     def _on_manual_profile_changed(self, profile_name):
         self._profile_manually_selected = True
@@ -1126,9 +1168,16 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
         self.status_label.configure(text="Building...")
 
         profile_flags = profile.get("cmake_flags", [])
-        update_repo = profile.get("update_repo", self.update_repo_var.get())
-        clean_build = profile.get("clean_build", self.clean_build_var.get())
+        update_repo = self.update_repo_var.get()
+        clean_build = self.clean_build_var.get()
         build_ui = self.build_ui_var.get()
+        core_only = self.core_only_var.get()
+        cpu_target = self.cpu_target_var.get() if self.cpu_target_var.get() in CPU_TARGETS else "portable"
+        try:
+            jobs = int(self.jobs_var.get().strip())
+        except (TypeError, ValueError):
+            jobs = 0
+        cuda_major = str(profile.get("cuda_major", "") or "")
 
         def do_build():
             try:
@@ -1143,7 +1192,11 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                     custom_flags=profile_flags,
                     clean_build=clean_build,
                     callback=callback,
-                    build_ui=build_ui
+                    build_ui=build_ui,
+                    cpu_target=cpu_target,
+                    jobs=jobs,
+                    core_only=core_only,
+                    cuda_major=cuda_major
                 )
 
                 duration = time.time() - start_time
@@ -1170,8 +1223,14 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
                     self._queue_build_log("BUILD FAILED!")
                     self._queue_build_log(f"Error: {error_msg}")
 
-                    # Show explanation
-                    explanation = get_error_explanation(error_msg)
+                    # Show the actual error lines, then an explanation
+                    error_lines = extract_error_lines(output)
+                    if error_lines:
+                        self._queue_build_log("")
+                        self._queue_build_log("Last error lines:")
+                        for line in error_lines:
+                            self._queue_build_log(f"  {line}")
+                    explanation = get_error_explanation(error_msg, output)
                     self._queue_build_log("")
                     self._queue_build_log(f"Cause: {explanation['cause']}")
                     self._queue_build_log(f"Solution: {explanation['solution']}")
@@ -1520,17 +1579,31 @@ For Vulkan: https://vulkan.lunarg.com/sdk/home
         else:
             self.selected_profile.set("")
 
-    def _select_profile_for_build_type(self, build_type):
-        """Select the first profile matching a recommended build type."""
-        profiles = load_profiles()
-        for profile in profiles:
-            if profile.get("build_type") == build_type and profile.get("name"):
-                name = profile["name"]
-                self.selected_profile.set(name)
-                self.on_profile_changed(name)
-                return name
-        self.selected_build_type.set(build_type)
+    def _select_profile_for_report(self, report):
+        """Select the profile that fits the hardware report best."""
+        name = select_profile_name(report, load_profiles())
+        if name:
+            self.selected_profile.set(name)
+            self.on_profile_changed(name)
+            return name
+        self.selected_build_type.set(get_recommendation(report))
         return ""
+
+    def _cpu_target_hint(self, report):
+        """Explain what the chosen CPU target means for this machine."""
+        features = set(report.get("cpu", {}).get("features", []))
+        arch = report.get("arch") or report.get("cpu", {}).get("arch") or ""
+        target = self.cpu_target_var.get() if hasattr(self, "cpu_target_var") else "portable"
+        if arch == "arm64":
+            return "CPU target: native (arm64 uses the compiler's own CPU detection)."
+        if target == "native":
+            return "CPU target: native (GGML_NATIVE=ON, uses " + (", ".join(sorted(features)) or "compiler defaults") + ")."
+        if "AVX2" not in features and features:
+            return "CPU target: portable (AVX2) - WARNING: this CPU reports no AVX2, choose 'native'."
+        unused = [f for f in ("AVX512", "AMX") if f in features]
+        if unused:
+            return f"CPU target: portable (AVX2). This CPU also has {', '.join(unused)}; choose 'native' to use it."
+        return "CPU target: portable (AVX2/FMA/F16C), matches this CPU."
 
     def export_system_report(self):
         """Export the system report as JSON."""

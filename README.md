@@ -41,36 +41,51 @@ macOS, Ubuntu and other Linux distros**.
 
 | Type | Backend | When to use |
 |------|---------|-------------|
-| CPU | `GGML_NATIVE` | No/disabled GPU |
-| CUDA | `GGML_CUDA` | NVIDIA |
-| Vulkan | `GGML_VULKAN` | Any Vulkan GPU — **recommended for AMD RDNA4** |
-| HIP/ROCm | `GGML_HIP` | AMD RDNA2/3 (use Vulkan for RDNA4) |
+| CPU | `GGML_CPU` | No/disabled GPU, Intel Macs |
+| CUDA 12.x | `GGML_CUDA` | NVIDIA, any GPU since Maxwell; driver 525+ |
+| CUDA 13.x | `GGML_CUDA` | NVIDIA Turing or newer (compute capability 7.5+); driver 580+ |
+| Vulkan | `GGML_VULKAN` | Any Vulkan GPU — **recommended for AMD RDNA4 (RX 9000 / AI PRO R9000)** |
+| HIP/ROCm | `GGML_HIP` | AMD RDNA2/3 (use Vulkan for RDNA4); gfx target auto-detected |
 | SYCL | `GGML_SYCL` | Intel GPU |
+| Metal | `GGML_METAL` | Apple Silicon only (Intel Macs get CPU or Vulkan/MoltenVK) |
 
-## Supported Build Sources (verified 2026-07-06)
+The hardware check picks the build type **and** the matching profile (for
+example the CUDA generation your driver supports, or the Intel-Mac CPU
+profile) and explains why on the dashboard.
 
-| Source | Repository | Branch / PR |
-|--------|-----------|-------------|
-| main | `ggml-org/llama.cpp` | `master` |
-| turboquant | `TheTom/llama-cpp-turboquant` | `feature/turboquant-kv-cache` |
-| turboquant 3/4 | `AtomicBot-ai/atomic-llama-cpp-turboquant` | `feature/turboquant-kv-cache` |
-| PrismML Ternary | `PrismML-Eng/llama.cpp` | `prism` |
-| OCR | `ggml-org/llama.cpp` | PR **#17400** |
-| Luce | `Luce-Org/lucebox-hub` | `main` (with submodules) |
-| DFlash | `Anbild/beellama.cpp` | `main` |
-| DSpark (Spark Attention) | `Anbild/beellama.cpp` | `main` |
-| Custom | *user-defined* | — |
+**CPU target** (build tab): `portable` builds for AVX2/FMA/F16C so the binary
+runs on any x86-64 CPU since Haswell/Zen 1; `native` lets llama.cpp enable
+AVX-512/AMX for the machine that builds it. Profiles no longer pin the ISA.
 
-> **Note:** DFlash, TurboQuant/TCQ and Spark Attention all live in
-> [`Anbeeld/beellama.cpp`](https://github.com/Anbild/beellama.cpp). PR-based
-> sources are fetched via `git fetch origin pull/<n>/head`, not plain clone.
+**Output folders** follow the Auto-Tuner convention
+`builds/<bNNNN>_<backend>_<suffix>/build/bin/…`, e.g.
+`b10830_vulkan_llama.cpp`. `bNNNN` is `git rev-list --count HEAD`, the same
+number `llama-server --version` prints. After the build the source tree is
+removed; only `build/bin` stays. HIP builds bundle the ROCm runtime DLLs and
+link the `rocblas/`/`hipblaslt/` kernel folders; CUDA builds bundle
+`cudart`/`cublas`. Every build ends with `llama-server --version` and
+`--list-devices` so a wrong backend is visible in the log.
+
+## Supported Build Sources
+
+| Source | Repository | Branch / PR | Folder suffix |
+|--------|-----------|-------------|---------------|
+| main | `ggml-org/llama.cpp` | `master` | `llama.cpp` |
+| turboquant | `TheTom/llama-cpp-turboquant` | `master` (pinned commit) | `tq_llama.cpp` |
+| PrismML Ternary/Bonsai | `PrismML-Eng/llama.cpp` | `prism` (pinned commit) | `2b_llama.cpp` |
+| DeepSeek-OCR | `ggml-org/llama.cpp` | PR **#17400** (pinned commit) | `ocr_llama.cpp` |
+| Diffusion-Gemma | `ggml-org/llama.cpp` | PR **#24427** (pinned commit) | `d_llama.cpp` |
+| Custom | *user-defined* | — | `<id>_llama.cpp` (override with `dir_suffix`) |
+
+> PR-based sources are fetched via `git fetch origin pull/<n>/head`, not plain
+> clone. Pinned commits are stored in `data/sources.json`.
 
 ## Installation
 
 ### Quick start
 
-**Windows** — double-click `start.bat` (requests admin, picks the right Python,
-installs deps, launches the GUI).
+**Windows** — double-click `start.bat` (picks the right Python, installs
+deps, launches the GUI; no admin rights needed).
 
 **macOS / Linux** — run:
 ```bash
@@ -102,7 +117,7 @@ python app.py
 ├── build_llamacpp.ps1       # Windows build pipeline
 ├── build_llamacpp.sh        # macOS/Linux build pipeline
 ├── start.bat / start.sh     # Launchers (use python_manager)
-├── data/                    # Config + history JSON
+├── data/                    # sources.json + profiles.json (history/report are generated)
 └── pyproject.toml
 ```
 
@@ -118,3 +133,39 @@ python app.py
 python -m pip install -e ".[dev]"
 pytest
 ```
+
+The tests cover the recommendation logic with synthetic hardware reports
+(RDNA4 detection, CUDA 12/13 selection, Apple Silicon vs. Intel Mac) and
+run on any platform.
+
+## Changelog
+
+### 2.3.0
+
+- Hardware check: CPUID feature detection on Windows fixed (the machine code
+  clobbered the output pointer, so features were always empty); real VRAM
+  for AMD/Intel on Windows (registry `qwMemorySize` instead of the 4 GB
+  `AdapterRAM` cap); RDNA4 detected via `hipInfo` gfx target and a wider
+  name list (Radeon AI PRO R9700 included); NVIDIA driver CUDA version and
+  compute capability reported.
+- Recommendation: separate CUDA 12.x / 13.x profiles chosen from driver and
+  GPU generation; Apple Silicon → Metal, Intel Mac → CPU (Metal is not
+  maintained for x86 Macs upstream); the dashboard explains the choice.
+- Profiles: no hard-coded `GPU_TARGETS=gfx1201`, no ISA flags, no forced
+  npm web-UI build. Untouched v2.2 default profiles are migrated once.
+- Build script (Windows): HIP builds import the VS developer environment,
+  detect the gfx target with `hipInfo`, apply the HIP SDK 7.2 / MSVC 14.5x
+  `<cmath>` header fix (LLVM PR #201563) in a private copy under `deps/`,
+  and bundle the ROCm runtime; CUDA picks the toolkit by generation, checks
+  the driver, sets `CMAKE_CUDA_ARCHITECTURES` from the installed GPUs and
+  bundles cudart/cublas; SPIRV-Headers cache works (wrong marker path);
+  no Chocolatey install, no global `git config`; Ninja from the VS bundle;
+  parallel jobs default to the CPU count; UTF-8 log output.
+- Folder names use `git rev-list --count HEAD` (matches
+  `llama-server --version`) and the Auto-Tuner suffixes (`_llama.cpp`).
+- GUI: "Clean build" / "Update repository" checkboxes are honoured (profiles
+  only pre-fill them); CPU target, parallel jobs and "core tools only"
+  options; post-build verification (`--version`, `--list-devices`) and the
+  actual error lines on failure.
+- Dependency check: HIP found via `HIP_PATH`/Program Files, Vulkan via
+  `glslc`, Ninja via the VS bundle, no `winget list` calls.

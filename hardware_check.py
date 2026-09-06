@@ -6,17 +6,18 @@ Works on Windows, Linux, and macOS.
 import subprocess
 import platform
 import os
+import re
 import json
 import ctypes
 from datetime import datetime
 from config import SYSTEM_REPORT_FILE
 
 
-def run_cmd(cmd, shell=True):
+def run_cmd(cmd, shell=True, timeout=30):
     """Run a command and return stdout, or None on failure."""
     try:
         result = subprocess.run(cmd, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True,
-                                shell=shell, timeout=30, encoding='utf-8', errors='replace')
+                                shell=shell, timeout=timeout, encoding='utf-8', errors='replace')
         if result.returncode == 0:
             return result.stdout.strip()
     except Exception:
@@ -27,7 +28,7 @@ def run_cmd(cmd, shell=True):
 def run_powershell(cmd):
     """Run a PowerShell command and return stdout, or None on failure."""
     try:
-        ps_cmd = ["powershell", "-Command", cmd]
+        ps_cmd = ["powershell", "-NoProfile", "-Command", cmd]
         result = subprocess.run(ps_cmd, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), text=True,
                                 timeout=30, encoding='utf-8', errors='replace')
         if result.returncode == 0:
@@ -94,21 +95,36 @@ def get_os_info():
         return f"{system} {version}"
 
 
+def get_arch():
+    """Normalized machine architecture: x86_64, arm64, or the raw value."""
+    machine = (platform.machine() or "").lower()
+    if machine in ("amd64", "x86_64", "x64"):
+        return "x86_64"
+    if machine in ("arm64", "aarch64"):
+        return "arm64"
+    return machine or "unknown"
+
+
 # ─── CPUID (Windows x86_64) ──────────────────────────────────────────────
 # Reads the CPU feature flags directly via the CPUID instruction using a tiny
 # slab of x86_64 machine code (VirtualAlloc+RWX). This is the only reliable
 # way to learn AVX/AVX2/AVX512/FMA/F16C/AMX on Windows without native deps.
 # Everything is wrapped so that any failure degrades gracefully to an empty
 # feature list instead of crashing or mis-reporting features.
+#
+# Windows x64 calling convention: rcx = out pointer, edx = leaf, r8d = subleaf.
+# The out pointer is copied to r9 first because CPUID itself clobbers ecx and
+# the subleaf has to be loaded into ecx before the instruction executes.
 _CPUID_CODE = bytes([
     0x53,                         # push rbx
+    0x49, 0x89, 0xC9,             # mov r9, rcx         (save out pointer)
     0x89, 0xD0,                   # mov eax, edx        (leaf, arg2)
     0x44, 0x89, 0xC1,             # mov ecx, r8d        (subleaf, arg3)
     0x0F, 0xA2,                   # cpuid
-    0x89, 0x01,                   # mov [rcx],    eax   out[0]
-    0x89, 0x59, 0x04,             # mov [rcx+4],  ebx   out[1]
-    0x89, 0x49, 0x08,             # mov [rcx+8],  ecx   out[2]
-    0x89, 0x51, 0x0C,             # mov [rcx+12], edx   out[3]
+    0x41, 0x89, 0x01,             # mov [r9],    eax    out[0]
+    0x41, 0x89, 0x59, 0x04,       # mov [r9+4],  ebx    out[1]
+    0x41, 0x89, 0x49, 0x08,       # mov [r9+8],  ecx    out[2]
+    0x41, 0x89, 0x51, 0x0C,       # mov [r9+12], edx    out[3]
     0x5B,                         # pop rbx
     0xC3,                         # ret
 ])
@@ -121,14 +137,15 @@ def _get_cpuid():
     global _cpuid_func
     if _cpuid_func is not None:
         return _cpuid_func
-    if platform.system() != "Windows" or platform.machine() not in ("AMD64", "x86_64"):
+    if platform.system() != "Windows" or get_arch() != "x86_64":
         return None
     try:
-        import ctypes
         PAGE_EXECUTE_READWRITE = 0x40
         MEM_COMMIT = 0x1000
-        MEM_RELEASE = 0x8000
         kernel32 = ctypes.windll.kernel32
+        kernel32.VirtualAlloc.restype = ctypes.c_void_p
+        kernel32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                          ctypes.c_uint32, ctypes.c_uint32]
         buf = kernel32.VirtualAlloc(None, len(_CPUID_CODE), MEM_COMMIT, PAGE_EXECUTE_READWRITE)
         if not buf:
             return None
@@ -215,7 +232,7 @@ def _linux_drm_vram():
 
 # ─── CPU detection ───────────────────────────────────────────────────────
 def get_cpu_info():
-    """Detect CPU model, cores, and threads."""
+    """Detect CPU model, cores, threads, architecture and ISA features."""
     system = platform.system()
     cpu_name = "Unknown"
     cores = 0
@@ -276,6 +293,7 @@ def get_cpu_info():
 
     return {
         "name": cpu_name,
+        "arch": get_arch(),
         "cores": cores,
         "threads": threads,
         "features": detect_cpu_features(system)
@@ -289,6 +307,7 @@ def detect_cpu_features(system):
     if system == "Windows":
         l1 = _cpuid(1, 0)
         l7 = _cpuid(7, 0)
+        l7_1 = _cpuid(7, 1)
         if l1:
             eax1, ebx1, ecx1, edx1 = l1
             osxsave = bool(ecx1 & (1 << 27))
@@ -303,10 +322,22 @@ def detect_cpu_features(system):
             eax7, ebx7, ecx7, edx7 = l7
             if ebx7 & (1 << 5):
                 features.append("AVX2")
+            if ebx7 & (1 << 8):
+                features.append("BMI2")
             if ebx7 & (1 << 16):
                 features.append("AVX512")
+                if ecx7 & (1 << 1):
+                    features.append("AVX512_VBMI")
+                if ecx7 & (1 << 11):
+                    features.append("AVX512_VNNI")
             if edx7 & (1 << 23):   # AMX-TILE
                 features.append("AMX")
+            if l7_1:
+                eax71 = l7_1[0]
+                if eax71 & (1 << 4):
+                    features.append("AVX_VNNI")
+                if "AVX512" in features and eax71 & (1 << 5):
+                    features.append("AVX512_BF16")
 
     elif system == "Darwin":
         # Intel Macs expose x86 feature flags via sysctl. Apple Silicon has
@@ -321,24 +352,40 @@ def detect_cpu_features(system):
             features.append("F16C")
         if "AVX2" in leaf7:
             features.append("AVX2")
+        if "BMI2" in leaf7:
+            features.append("BMI2")
         if "AVX512" in leaf7:
             features.append("AVX512")
 
     else:  # Linux
         cpuinfo = run_cmd("cat /proc/cpuinfo")
         if cpuinfo:
-            cl = cpuinfo.lower()
-            if "avx " in cl or "avx\n" in cl:
+            flags = set()
+            for line in cpuinfo.lower().splitlines():
+                if line.startswith("flags") and ":" in line:
+                    flags.update(line.split(":", 1)[1].split())
+                    break
+            if "avx" in flags:
                 features.append("AVX")
-            if "avx2" in cl:
+            if "avx2" in flags:
                 features.append("AVX2")
-            if "avx512" in cl or "avx-512" in cl:
+            if "bmi2" in flags:
+                features.append("BMI2")
+            if "avx512f" in flags:
                 features.append("AVX512")
-            if "fma" in cl:
+                if "avx512vbmi" in flags:
+                    features.append("AVX512_VBMI")
+                if "avx512_vnni" in flags:
+                    features.append("AVX512_VNNI")
+                if "avx512_bf16" in flags:
+                    features.append("AVX512_BF16")
+            if "fma" in flags:
                 features.append("FMA")
-            if "f16c" in cl:
+            if "f16c" in flags:
                 features.append("F16C")
-            if "amx" in cl:
+            if "avx_vnni" in flags:
+                features.append("AVX_VNNI")
+            if "amx_tile" in flags:
                 features.append("AMX")
 
     return features
@@ -416,6 +463,111 @@ def get_ram_info():
     return {"total_gb": 0, "free_gb": 0}
 
 
+# ─── GPU helpers ─────────────────────────────────────────────────────────
+def _windows_registry_vram():
+    """Read dedicated VRAM per adapter from the display-class registry keys.
+
+    Win32_VideoController.AdapterRAM is a uint32 and wraps at 4 GiB, so AMD
+    and Intel cards with more memory are reported as 4 GB. The driver stores
+    the true size as HardwareInformation.qwMemorySize (QWORD). Returns a list
+    of (driver_desc, bytes) in enumeration order.
+    """
+    result = []
+    try:
+        import winreg
+        base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
+        i = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            if not sub.isdigit():
+                continue
+            try:
+                key = winreg.OpenKey(root, sub)
+                desc = winreg.QueryValueEx(key, "DriverDesc")[0]
+                size, kind = winreg.QueryValueEx(key, "HardwareInformation.qwMemorySize")
+                if isinstance(size, bytes):
+                    size = int.from_bytes(size[:8], "little")
+                if desc and int(size) > 0:
+                    result.append((str(desc), int(size)))
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return result
+
+
+def _parse_nvidia_smi():
+    """Return (gpus, driver_version, driver_cuda_version) from nvidia-smi.
+
+    gpus is a list of {"name", "compute_cap", "vram_gb"} in nvidia-smi order.
+    driver_cuda_version is the highest CUDA runtime the driver supports (from
+    the nvidia-smi banner), which caps the toolkit a build may link against.
+    """
+    gpus = []
+    driver = ""
+    driver_cuda = ""
+    csv = run_cmd("nvidia-smi --query-gpu=name,driver_version,memory.total,compute_cap --format=csv,noheader,nounits")
+    if csv is None:
+        # Older drivers do not know compute_cap; retry without it.
+        csv = run_cmd("nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader,nounits")
+    if csv:
+        for line in csv.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3:
+                continue
+            entry = {"name": parts[0], "compute_cap": parts[3] if len(parts) > 3 else "", "vram_gb": 0}
+            try:
+                entry["vram_gb"] = round(int(parts[2]) / 1024, 1)
+            except ValueError:
+                pass
+            driver = parts[1] or driver
+            gpus.append(entry)
+    banner = run_cmd("nvidia-smi")
+    if banner:
+        m = re.search(r"CUDA Version:\s*([0-9]+\.[0-9]+)", banner)
+        if m:
+            driver_cuda = m.group(1)
+    return gpus, driver, driver_cuda
+
+
+def _parse_nvcc_version(text):
+    """Extract "12.8" from nvcc --version output."""
+    if not text:
+        return ""
+    m = re.search(r"release\s+([0-9]+\.[0-9]+)", text)
+    return m.group(1) if m else ""
+
+
+def _detect_amd_gfx_targets(system):
+    """Return the list of AMD gfx targets (e.g. ["gfx1201"]) or [].
+
+    Windows ships hipInfo.exe with the HIP SDK; rocminfo and
+    rocm_agent_enumerator only exist on Linux.
+    """
+    targets = []
+    outputs = []
+    if system == "Windows":
+        outputs.append(run_cmd("hipInfo 2>nul"))
+    else:
+        outputs.append(run_cmd("rocm_agent_enumerator 2>/dev/null"))
+        outputs.append(run_cmd("rocminfo 2>/dev/null"))
+    for out in outputs:
+        if not out:
+            continue
+        for m in re.finditer(r"\b(gfx[0-9a-f]{3,5})\b", out):
+            name = m.group(1)
+            if name == "gfx000":   # rocm_agent_enumerator lists the CPU as gfx000
+                continue
+            if name not in targets:
+                targets.append(name)
+    return targets
+
+
 # ─── GPU detection ───────────────────────────────────────────────────────
 def get_gpu_info():
     """Detect GPU(s), VRAM, and vendor."""
@@ -426,12 +578,14 @@ def get_gpu_info():
     has_intel = False
     has_apple = False
     nvidia_driver_version = ""
+    nvidia_driver_cuda_version = ""
     cuda_available = False
     cuda_version = ""
     vulkan_available = False
     vulkan_sdk = False
     opencl_available = False
     rocm_available = False
+    amd_gfx_targets = []
     sycl_available = False
     metal_available = False
 
@@ -465,34 +619,36 @@ def get_gpu_info():
                     if line and "Controller" not in line and "Name" not in line:
                         gpus.append({"name": line, "vendor": detect_vendor(line), "vram_gb": 0})
 
-        nvidia_smi = run_cmd("nvidia-smi --query-gpu=name,driver_version --format=csv,noheader")
-        if nvidia_smi:
-            has_nvidia = True
-            for line in nvidia_smi.split("\n"):
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 2:
-                    nvidia_driver_version = parts[1]
-                    if gpus and "NVIDIA" in parts[0]:
-                        gpus[0]["name"] = parts[0]
+        # Accurate VRAM for every vendor from the display-class registry.
+        reg_vram = _windows_registry_vram()
+        used = set()
+        for gpu in gpus:
+            for idx, (desc, size) in enumerate(reg_vram):
+                if idx in used:
+                    continue
+                if desc.strip().lower() == str(gpu.get("name", "")).strip().lower():
+                    gpu["vram_gb"] = round(size / (1024 ** 3), 1)
+                    used.add(idx)
+                    break
 
         nvcc = run_cmd("nvcc --version")
         if nvcc:
             cuda_available = True
-            for part in nvcc.split("\n"):
-                if "release" in part:
-                    cuda_version = part.strip().split()[-1]
-                    break
+            cuda_version = _parse_nvcc_version(nvcc)
 
         if run_cmd("vulkaninfo --summary 2>nul"):
             vulkan_available = True
-        if run_cmd("glslangValidator --version 2>nul"):
+        if run_cmd("glslc --version 2>nul") or run_cmd("glslangValidator --version 2>nul"):
             vulkan_sdk = True
         else:
             _vulkan_sdk_env = os.environ.get("VULKAN_SDK", "")
-            if _vulkan_sdk_env and os.path.isfile(os.path.join(_vulkan_sdk_env, "Bin", "glslangValidator.exe")):
+            if _vulkan_sdk_env and (
+                    os.path.isfile(os.path.join(_vulkan_sdk_env, "Bin", "glslc.exe"))
+                    or os.path.isfile(os.path.join(_vulkan_sdk_env, "Bin", "glslangValidator.exe"))):
                 vulkan_sdk = True
 
-        if run_cmd("hipconfig --version 2>nul") or run_cmd("hipcc --version 2>nul"):
+        hip_path = os.environ.get("HIP_PATH", "")
+        if run_cmd("hipcc --version 2>nul") or (hip_path and os.path.isfile(os.path.join(hip_path, "bin", "hipcc.exe"))):
             rocm_available = True
 
         if run_cmd("icpx --version 2>nul") or run_cmd("icx --version 2>nul"):
@@ -501,47 +657,39 @@ def get_gpu_info():
         if run_cmd("clinfo 2>nul"):
             opencl_available = True
 
-        for gpu in gpus:
-            vendor = gpu.get("vendor")
-            if vendor == "AMD":
-                has_amd = True
-            elif vendor == "Intel":
-                has_intel = True
-
     elif system == "Darwin":
         # system_profiler is the only reliable GPU source on macOS.
         sp = run_cmd("system_profiler SPDisplaysDataType")
         if sp:
-            import re
             for block in re.split(r"\n\s*\n", sp):
                 model = re.search(r"Chipset Model:\s*(.+)", block)
                 vram = re.search(r"VRAM .*?:\s*([0-9]+)\s*MB", block)
-                metal = re.search(r"Metal:\s*(Supported,.+)", block)
-                name = model.group(1).strip() if model else "Unknown"
+                if not model:
+                    continue
+                name = model.group(1).strip()
                 vram_gb = round(int(vram.group(1)) / 1024, 1) if vram else 0
                 vendor = detect_vendor(name)
                 if vendor == "Unknown" and "apple" in name.lower():
                     vendor = "Apple"
                 gpus.append({"name": name, "vendor": vendor, "vram_gb": vram_gb})
-        metal_available = True  # Metal is always available on modern macOS.
+        # Apple Silicon has unified memory: the GPU can use (almost) all RAM.
+        if get_arch() == "arm64":
+            total = run_cmd("sysctl -n hw.memsize")
+            if total and total.isdigit():
+                for gpu in gpus:
+                    if gpu.get("vendor") == "Apple" and not gpu.get("vram_gb"):
+                        gpu["vram_gb"] = round(int(total) / (1024 ** 3), 1)
+                        gpu["unified_memory"] = True
+        # Metal is only a sensible llama.cpp backend on Apple Silicon. Upstream
+        # builds its macOS x64 releases with GGML_METAL=OFF.
+        metal_available = get_arch() == "arm64"
         if run_cmd("nvcc --version 2>/dev/null"):
             cuda_available = True
-            for part in (run_cmd("nvcc --version") or "").split("\n"):
-                if "release" in part:
-                    cuda_version = part.strip().split()[-1]
-                    break
+            cuda_version = _parse_nvcc_version(run_cmd("nvcc --version") or "")
         if run_cmd("vulkaninfo --summary 2>/dev/null"):
             vulkan_available = True
-        for gpu in gpus:
-            vendor = gpu.get("vendor")
-            if vendor == "NVIDIA":
-                has_nvidia = True
-            elif vendor == "AMD":
-                has_amd = True
-            elif vendor == "Intel":
-                has_intel = True
-            elif vendor == "Apple":
-                has_apple = True
+        if run_cmd("glslc --version 2>/dev/null") or run_cmd("glslangValidator --version 2>/dev/null"):
+            vulkan_sdk = True
 
     else:  # Linux
         lspci = run_cmd("lspci 2>/dev/null | grep -iE 'vga|3d|display'")
@@ -550,27 +698,14 @@ def get_gpu_info():
                 if line.strip():
                     gpus.append({"name": line.strip(), "vendor": detect_vendor(line), "vram_gb": 0})
 
-        nvidia_smi = run_cmd("nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null")
-        if nvidia_smi:
-            has_nvidia = True
-            for line in nvidia_smi.split("\n"):
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 2:
-                    nvidia_driver_version = parts[1]
-                    if gpus and "NVIDIA" in parts[0]:
-                        gpus[0]["name"] = parts[0]
-
         nvcc = run_cmd("nvcc --version 2>/dev/null")
         if nvcc:
             cuda_available = True
-            for part in nvcc.split("\n"):
-                if "release" in part:
-                    cuda_version = part.strip().split()[-1]
-                    break
+            cuda_version = _parse_nvcc_version(nvcc)
 
         if run_cmd("vulkaninfo --summary 2>/dev/null"):
             vulkan_available = True
-        if run_cmd("glslangValidator --version 2>/dev/null"):
+        if run_cmd("glslc --version 2>/dev/null") or run_cmd("glslangValidator --version 2>/dev/null"):
             vulkan_sdk = True
         elif run_cmd("test -d /usr/include/vulkan && echo yes"):
             vulkan_sdk = True
@@ -584,31 +719,48 @@ def get_gpu_info():
         if run_cmd("clinfo 2>/dev/null") or os.path.isdir("/etc/OpenCL/vendors"):
             opencl_available = True
 
-        for gpu in gpus:
-            vendor = gpu.get("vendor")
-            if vendor == "NVIDIA":
-                has_nvidia = True
-            elif vendor == "AMD":
-                has_amd = True
-            elif vendor == "Intel":
-                has_intel = True
+    # NVIDIA: nvidia-smi is authoritative for name, VRAM, driver and CC.
+    if system != "Darwin":
+        nv_gpus, nvidia_driver_version, nvidia_driver_cuda_version = _parse_nvidia_smi()
+        if nv_gpus:
+            has_nvidia = True
+            nvidia_slots = [g for g in gpus if g.get("vendor") == "NVIDIA"]
+            for idx, nv in enumerate(nv_gpus):
+                if idx < len(nvidia_slots):
+                    target = nvidia_slots[idx]
+                else:
+                    target = {"vendor": "NVIDIA"}
+                    gpus.append(target)
+                target["name"] = nv["name"]
+                target["vendor"] = "NVIDIA"
+                if nv["vram_gb"]:
+                    target["vram_gb"] = nv["vram_gb"]
+                if nv["compute_cap"]:
+                    target["compute_cap"] = nv["compute_cap"]
 
-    # Accurate VRAM per vendor (replaces the unreliable AdapterRAM hint).
-    amd_vram_list = _linux_drm_vram() if system == "Linux" else []
-    amd_idx = 0
+    # AMD: gfx targets (needed for HIP GPU_TARGETS and RDNA4 detection).
+    if rocm_available or any(g.get("vendor") == "AMD" for g in gpus):
+        amd_gfx_targets = _detect_amd_gfx_targets(system)
+
+    # Linux AMD VRAM from /sys/class/drm.
+    if system == "Linux":
+        amd_vram_list = _linux_drm_vram()
+        amd_idx = 0
+        for gpu in gpus:
+            if gpu.get("vendor") == "AMD" and amd_idx < len(amd_vram_list):
+                gpu["vram_gb"] = round(amd_vram_list[amd_idx] / (1024 ** 3), 1)
+                amd_idx += 1
+
     for gpu in gpus:
-        name = gpu.get("name", "")
-        if "NVIDIA" in name:
-            vram = run_cmd("nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits")
-            if vram:
-                try:
-                    gpu["vram_gb"] = round(int(vram.split("\n")[0].strip()) / 1024, 1)
-                except ValueError:
-                    gpu["vram_gb"] = gpu.get("vram_gb", 0)
-        elif system == "Linux" and gpu.get("vendor") == "AMD" and amd_idx < len(amd_vram_list):
-            # Best-effort: assign /sys/class/drm VRAM values to AMD GPUs in order.
-            gpu["vram_gb"] = round(amd_vram_list[amd_idx] / (1024 ** 3), 1)
-            amd_idx += 1
+        vendor = gpu.get("vendor")
+        if vendor == "NVIDIA":
+            has_nvidia = True
+        elif vendor == "AMD":
+            has_amd = True
+        elif vendor == "Intel":
+            has_intel = True
+        elif vendor == "Apple":
+            has_apple = True
 
     return {
         "gpus": gpus,
@@ -617,12 +769,14 @@ def get_gpu_info():
         "has_intel": has_intel,
         "has_apple": has_apple,
         "nvidia_driver_version": nvidia_driver_version,
+        "nvidia_driver_cuda_version": nvidia_driver_cuda_version,
         "cuda_available": cuda_available,
         "cuda_version": cuda_version,
         "vulkan_available": vulkan_available,
         "vulkan_sdk": vulkan_sdk,
         "opencl_available": opencl_available,
         "rocm_available": rocm_available,
+        "amd_gfx_targets": amd_gfx_targets,
         "sycl_available": sycl_available,
         "metal_available": metal_available
     }
@@ -642,28 +796,35 @@ def detect_vendor(gpu_line):
     return "Unknown"
 
 
-def is_rdna4(gpu_name):
-    """Detect AMD RDNA4 (Radeon RX 9000 series / gfx120x).
+# Marketing names of RDNA4 parts (gfx1200/gfx1201). Used only when no gfx
+# target could be read from the HIP SDK / ROCm tools.
+_RDNA4_NAME_PATTERNS = (
+    r"\brx\s*90[0-9]0\b",          # RX 9070 XT, RX 9070, RX 9060 XT, RX 9070 GRE
+    r"\bradeon\s+ai\s+pro\s+r9[0-9]{3}\b",  # Radeon AI PRO R9700 / R9600
+    r"\br9[67]00\b",
+    r"\bgfx120[01]\b",
+    r"\brdna\s*4\b",
+)
 
-    RDNA4 GPUs have very poor/buggy ROCm (HIP) support; the recommended and
-    proven backend for them is Vulkan with a recent SPIRV-Headers build.
+
+def is_rdna4(gpu_name):
+    """Detect AMD RDNA4 (Radeon RX 9000 / Radeon AI PRO R9000, gfx120x).
+
+    RDNA4 GPUs have poor/buggy ROCm (HIP) support on Windows; the recommended
+    and proven backend for them is Vulkan with a recent SPIRV-Headers build.
     """
     if not gpu_name:
         return False
     low = gpu_name.lower()
-    if "rx 90" in low or "radeon rx 9" in low or "9070" in low or "9 900" in low:
-        return True
-    if "gfx1200" in low or "gfx1201" in low:
-        return True
-    if "rdna4" in low:
-        return True
-    return False
+    return any(re.search(p, low) for p in _RDNA4_NAME_PATTERNS)
 
 
 def has_rdna4_gpu(report):
     """True if any GPU in the report is an AMD RDNA4 part."""
-    gpus = report.get("gpu", {}).get("gpus", [])
-    return any(is_rdna4(g.get("name", "")) for g in gpus)
+    gpu_info = report.get("gpu", {})
+    if any(t.startswith("gfx120") for t in gpu_info.get("amd_gfx_targets", []) or []):
+        return True
+    return any(is_rdna4(g.get("name", "")) for g in gpu_info.get("gpus", []))
 
 
 def get_free_disk_space(path=None):
@@ -687,6 +848,7 @@ def run_full_check():
     """Run all hardware checks and return a comprehensive report."""
     report = {
         "os": get_os_info(),
+        "arch": get_arch(),
         "cpu": get_cpu_info(),
         "ram": get_ram_info(),
         "gpu": get_gpu_info(),
@@ -703,24 +865,58 @@ def run_full_check():
     return report
 
 
+# ─── Recommendation ──────────────────────────────────────────────────────
+def _report_is_macos(report):
+    report_os = str(report.get("os", ""))
+    return report_os.startswith("macOS") or report_os.startswith("Darwin")
+
+
+def _report_arch(report):
+    return report.get("arch") or report.get("cpu", {}).get("arch") or ""
+
+
+def _version_tuple(text):
+    try:
+        return tuple(int(p) for p in str(text).split(".")[:2])
+    except ValueError:
+        return ()
+
+
+def recommend_cuda_major(report):
+    """Return "12" or "13": the CUDA toolkit generation to build with.
+
+    CUDA 13 dropped Maxwell/Pascal/Volta (sm_50..sm_70) and needs a 580+
+    driver. When the driver cannot run 13.x or a GPU is older than Turing,
+    12.x is the only working choice. Without nvidia-smi data, 12 is the safe
+    default.
+    """
+    gpu_info = report.get("gpu", {})
+    driver_cuda = _version_tuple(gpu_info.get("nvidia_driver_cuda_version", ""))
+    if not driver_cuda or driver_cuda < (13, 0):
+        return "12"
+    for gpu in gpu_info.get("gpus", []):
+        if gpu.get("vendor") != "NVIDIA":
+            continue
+        cc = _version_tuple(gpu.get("compute_cap", ""))
+        if cc and cc < (7, 5):
+            return "12"
+    return "13"
+
+
 def get_recommendation(report):
     """Recommend a build type based on hardware report."""
     gpu_info = report.get("gpu", {})
-    report_os = str(report.get("os", ""))
-    report_is_macos = (
-        report_os.startswith("macOS")
-        or report_os.startswith("Darwin")
-        or bool(gpu_info.get("metal_available"))
-    )
 
-    # On real macOS hardware reports, Metal is the relevant llama.cpp GPU
-    # backend. Do not key this solely off platform.system(): CI runs the
-    # synthetic Linux/Windows recommendation tests on macOS too.
-    if report_is_macos:
-        return "Metal"
+    # macOS: Metal on Apple Silicon only. Intel Macs get a CPU build (upstream
+    # ships its x64 macOS releases with GGML_METAL=OFF); Vulkan via MoltenVK
+    # is available as a manual profile.
+    if _report_is_macos(report) or gpu_info.get("has_apple"):
+        if _report_arch(report) == "arm64" or gpu_info.get("has_apple"):
+            return "Metal"
+        return "CPU"
 
-    # RDNA4 (Radeon RX 9000): ROCm/HIP is unreliable, Vulkan is the proven
-    # backend. Recommend Vulkan even if ROCm happens to be installed.
+    # RDNA4 (Radeon RX 9000 / AI PRO R9000): ROCm/HIP on Windows is unreliable,
+    # Vulkan is the proven backend. Recommend Vulkan even if ROCm is installed.
     if has_rdna4_gpu(report):
         return "Vulkan"
 
@@ -736,8 +932,67 @@ def get_recommendation(report):
         return "CPU"
 
 
+def get_recommendation_reason(report):
+    """One short sentence explaining why get_recommendation() chose its type."""
+    gpu_info = report.get("gpu", {})
+    rec = get_recommendation(report)
+    if rec == "Metal":
+        return "Apple Silicon with unified memory: Metal is the native llama.cpp backend."
+    if _report_is_macos(report) and rec == "CPU":
+        return "Intel Mac: Metal is not maintained for x86 Macs, use the CPU build (or Vulkan via MoltenVK)."
+    if rec == "Vulkan" and has_rdna4_gpu(report):
+        names = ", ".join(g.get("name", "") for g in gpu_info.get("gpus", []) if g.get("vendor") == "AMD")
+        return f"RDNA4 detected ({names}): HIP on Windows is unreliable for gfx120x, Vulkan is the proven backend."
+    if rec == "CUDA":
+        major = recommend_cuda_major(report)
+        drv = gpu_info.get("nvidia_driver_cuda_version") or "unknown"
+        return f"NVIDIA GPU with CUDA toolkit found. Driver supports CUDA {drv}; recommended toolkit generation: {major}.x."
+    if rec == "HIP":
+        targets = ", ".join(gpu_info.get("amd_gfx_targets", [])) or "target not detected"
+        return f"AMD GPU with HIP SDK found ({targets})."
+    if rec == "SYCL":
+        return "Intel GPU with oneAPI compiler found."
+    if rec == "Vulkan":
+        return "Vulkan runtime found and no vendor toolkit installed: Vulkan works on any GPU."
+    return "No usable GPU backend found: CPU build."
+
+
+def select_profile_name(report, profiles):
+    """Pick the best matching profile name for a report, or "" if none fits.
+
+    Profiles may carry optional hints:
+      - "cuda_major": "12" | "13"  (which toolkit generation the profile targets)
+      - "platform":   "darwin-arm64" | "darwin-x86_64" | ... (restrict to a platform)
+    """
+    rec = get_recommendation(report)
+    plat = ""
+    if _report_is_macos(report):
+        plat = f"darwin-{_report_arch(report) or 'x86_64'}"
+    cuda_major = recommend_cuda_major(report) if rec == "CUDA" else ""
+
+    candidates = [p for p in profiles if p.get("build_type") == rec and p.get("name")]
+    if not candidates:
+        return ""
+    # 1. exact platform + cuda hints
+    for p in candidates:
+        if plat and p.get("platform") == plat:
+            return p["name"]
+    for p in candidates:
+        if cuda_major and str(p.get("cuda_major", "")) == cuda_major:
+            return p["name"]
+    # 2. profiles without a conflicting hint
+    for p in candidates:
+        if p.get("platform") and p.get("platform") != plat:
+            continue
+        if cuda_major and p.get("cuda_major") and str(p.get("cuda_major")) != cuda_major:
+            continue
+        return p["name"]
+    return candidates[0]["name"]
+
+
 if __name__ == "__main__":
     report = run_full_check()
     print(json.dumps(report, indent=2))
     rec = get_recommendation(report)
     print(f"\nRecommended build: {rec}")
+    print(get_recommendation_reason(report))
