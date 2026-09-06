@@ -1,4 +1,4 @@
-<p align="center"><img src="https://raw.githubusercontent.com/nextscript/Llama.cpp-Build-Assistant/refs/heads/main/logobig.png" width="350" height="350"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/nextscript/Llama.cpp-Build-Assistant/refs/heads/main/logobig.png"></p>
 
 # Llama.cpp Build Assistant
 
